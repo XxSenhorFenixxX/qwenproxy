@@ -254,21 +254,19 @@ export function buildToolCallContract(
   const result = `[TOOL CALL CONTRACT - MUST FOLLOW]
 Available tool names: ${toolList}
 ${fileMutationLine}
-Format:
+Format (one line per tool call):
 
-<tool_call>
-{"name": "tool_name", "arguments": {"param_name": "value"}}
-<` + `/tool_call>
+TOOL: tool_name | {"param_name": "value"}
 
 Rules:
 1. Use the exact tool name as provided by the client. Tool names vary by editor/integration; do not require names like read_file, edit_file, write_file, or apply_patch to exist.
 2. Do not invent, guess, rename, or approximate tool names. If a tool capability exists under a different name, call that exact provided name.
-3. Do not output raw JSON as a tool call.
+3. Do not output raw JSON, XML tags, or markdown fences as a tool call. Use the single-line TOOL format only.
 4. ${forcedLine}
 5. ${parallelLine}
-6. If no tool is needed, do not emit any tool call block.
-7. Put only valid JSON inside each <tool_call> block. No markdown fences, comments, or explanatory text inside the block.
-8. If you emit a tool call, stop after the closing </tool_call> tag and wait for the tool response.`;
+6. If no tool is needed, do not emit any tool call line.
+7. Each tool call must be exactly one line: TOOL: <name> | <json>.
+8. If you emit a tool call, stop after the line and wait for the tool response.`;
   if (contractCache.size >= CACHE_MAX_ENTRIES) contractCache.clear();
   contractCache.set(cacheKey, result);
   return result;

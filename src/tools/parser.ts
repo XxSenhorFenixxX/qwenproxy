@@ -22,6 +22,58 @@ const TOOL_OPEN_RE = /<tool_call\b[^>]*>/i;
 const TOOL_END = '</tool_call>';
 const TOOL_SHORT_END = '</tool>';
 
+// ─── TOOL: name | {json} Line Format (PRIMARY) ─────────────────────────────────
+const TOOL_LINE_RE = /^TOOL:\s*(\S+)\s*\|\s*(.+)$/m;
+
+/**
+ * Try to parse a complete TOOL: name | {json} line from the buffer.
+ * Returns parsed tool calls and the consumed length, or null if no complete line found.
+ */
+function parseToolLineFormat(buffer: string): { toolCalls: ParsedToolCall[]; consumed: number } | null {
+  const lines = buffer.split('\n');
+  const toolCalls: ParsedToolCall[] = [];
+  let consumed = 0;
+  let foundAny = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    const match = trimmed.match(/^TOOL:\s*(\S+)\s*\|\s*(.+)$/);
+    if (match) {
+      const name = match[1];
+      const jsonStr = match[2].trim();
+      foundAny = true;
+
+      try {
+        const parsed = robustParseJSON(jsonStr);
+        if (parsed && typeof parsed === 'object') {
+          toolCalls.push({
+            id: `call_${crypto.randomUUID()}`,
+            name,
+            arguments: typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {},
+          });
+        } else {
+          logger.warn('[parser] TOOL: line parsed but arguments not an object', { name, jsonStr: jsonStr.substring(0, 200) });
+        }
+      } catch {
+        logger.warn('[parser] TOOL: line has invalid JSON', { name, jsonStr: jsonStr.substring(0, 200) });
+      }
+
+      consumed += line.length + 1;
+    } else if (foundAny) {
+      break;
+    } else {
+      consumed += line.length + 1;
+    }
+  }
+
+  if (toolCalls.length > 0) {
+    return { toolCalls, consumed };
+  }
+  return null;
+}
+
 function decodeXmlEntities(value: string): string {
   return value
     .replace(/&quot;/g, '"')
@@ -348,6 +400,25 @@ export class StreamingToolParser {
 
     while (this.buffer.length > 0) {
       if (!this.insideTool) {
+        // PRIMARY: Check for TOOL: name | {json} line format
+        const toolLineResult = parseToolLineFormat(this.buffer);
+        if (toolLineResult && toolLineResult.toolCalls.length > 0) {
+          // Emit preceding non-TOOL text lines
+          const textBlock = this.buffer.substring(0, toolLineResult.consumed);
+          for (const tl of textBlock.split('\n')) {
+            if (!tl.trim().match(/^TOOL:/) && this.emittedToolCallCount === 0) {
+              result.text += tl + '\n';
+            }
+          }
+          for (const tc of toolLineResult.toolCalls) {
+            result.toolCalls.push(tc);
+            this.emittedToolCallCount++;
+          }
+          this.buffer = this.buffer.substring(toolLineResult.consumed);
+          continue;
+        }
+
+        // FALLBACK: Check for XML <tool_call> tags
         if (this.buffer.indexOf('<') === -1) {
           if (this.emittedToolCallCount === 0) result.text += this.buffer;
           this.buffer = '';
