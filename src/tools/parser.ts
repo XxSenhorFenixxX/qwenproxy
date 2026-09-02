@@ -50,8 +50,8 @@ function parseToolLineFormat(buffer: string): { toolCalls: ParsedToolCall[]; con
 
       // Only consume if the JSON looks complete (ends with })
       const jsonEndsCleanly = jsonStr.endsWith('}');
-      if (!jsonEndsCleanly && isLast) {
-        // Incomplete JSON at end of buffer - wait for more data
+      if (!jsonEndsCleanly) {
+        // Incomplete JSON - wait for more data regardless of line position
         break;
       }
 
