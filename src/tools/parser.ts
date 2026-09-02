@@ -18,75 +18,17 @@ export interface ParserResult {
 
 // ─── XML Helpers ───────────────────────────────────────────────────────────────
 
-const TOOL_OPEN_RE = /<tool_call\b[^>]*>/i;
+const TOOL_OPEN_RE = /<(?:tool_call[a-z0-9_ -]*|tools|function_call|tool)(?:\s+[^>{\n]*>|>|(?=[\s\n{]))/i;
 const TOOL_END = '</tool_call>';
 const TOOL_SHORT_END = '</tool>';
-
-// ─── TOOL: name | {json} Line Format (PRIMARY) ─────────────────────────────────
-const TOOL_LINE_RE = /^TOOL:\s*(\S+)\s*\|\s*(.+)$/m;
-
-/**
- * Try to parse a complete TOOL: name | {json} line from the buffer.
- * Returns parsed tool calls and the consumed length, or null if no complete line found.
- */
-function parseToolLineFormat(buffer: string): { toolCalls: ParsedToolCall[]; consumed: number } | null {
-  // Split on newlines, but also check the last segment (may lack trailing newline)
-  const lines = buffer.split('\n');
-  const toolCalls: ParsedToolCall[] = [];
-  let consumed = 0;
-  let foundAny = false;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-    const isLast = i === lines.length - 1;
-    const lineLen = line.length + (isLast && !buffer.endsWith('\n') ? 0 : 1);
-
-    // Try matching the TOOL: line format
-    const match = trimmed.match(/^TOOL:\s*(\S+)\s*\|\s*(.+)$/);
-    if (match) {
-      const name = match[1];
-      const jsonStr = match[2].trim();
-
-      // Only consume if the JSON looks complete (ends with })
-      const jsonEndsCleanly = jsonStr.endsWith('}');
-      if (!jsonEndsCleanly && isLast) {
-        // Incomplete JSON at end of buffer - wait for more data
-        console.log('[parser:TOOL_INCOMPLETE]', { jsonEnds: jsonStr.slice(-30) });
-        break;
-      }
-
-      foundAny = true;
-
-      try {
-        const parsed = robustParseJSON(jsonStr);
-        if (parsed && typeof parsed === 'object') {
-          toolCalls.push({
-            id: `call_${crypto.randomUUID()}`,
-            name,
-            arguments: typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {},
-          });
-        } else {
-          logger.warn('[parser] TOOL: line parsed but arguments not an object', { name, jsonStr: jsonStr.substring(0, 200) });
-        }
-      } catch {
-        logger.warn('[parser] TOOL: line has invalid JSON', { name, jsonStr: jsonStr.substring(0, 200) });
-      }
-
-      consumed += lineLen;
-    } else if (foundAny) {
-      // Non-TOOL line after TOOL lines - stop consuming
-      break;
-    } else {
-      consumed += lineLen;
-    }
-  }
-
-  if (toolCalls.length > 0) {
-    return { toolCalls, consumed };
-  }
-  return null;
-}
+const CLOSING_TAGS = [
+  '</tool_call_needed>',
+  '</tool_call_request>',
+  '</tool_call>',
+  '</tools>',
+  '</function_call>',
+  '</tool>',
+];
 
 function decodeXmlEntities(value: string): string {
   return value
@@ -130,6 +72,13 @@ function normalizeToolCallObject(parsed: any): any {
     };
   }
   return parsed;
+}
+
+function stripWrapperTags(str: string): string {
+  let res = str.trim();
+  res = res.replace(/^\s*<\/?(?:tool_arguments|arguments|args)\b[^>]*>\s*/i, '');
+  res = res.replace(/\s*<\/?(?:tool_arguments|arguments|args|tool_call[a-z0-9_ -]*|tools|function_call|tool)\b[^>]*>\s*$/i, '');
+  return res.trim();
 }
 
 function splitTopLevelJsonValues(input: string): string[] {
@@ -181,8 +130,24 @@ function coerceParameterValue(rawValue: string): unknown {
  */
 function extractToolName(openTag: string, block: string): string {
   const combined = `${openTag}\n${block}`;
-  const attrMatch = combined.match(/<tool_call\b[^>]*\bname\s*=\s*["']([^"']+)["']/i);
+
+  // 1. Underscore tool name in opening tag: <tool_call_bash> or <tool_call_read_file>
+  const underscoreMatch = openTag.match(/<(?:tool_call|function_call|tool)_([\w.-]+)>/i);
+  if (underscoreMatch && !['needed', 'request', 'dangerously_skip_permissions'].includes(underscoreMatch[1].toLowerCase())) {
+    return underscoreMatch[1];
+  }
+
+  // 2. Bare name in opening tag: <tool_call bash> or <tool bash> or <tools bash>
+  const bareTagMatch = openTag.match(/<(?:tool_call[a-z0-9_ -]*|tools|function_call|tool)\s+([\w.-]+)>/i);
+  if (bareTagMatch && !['name', 'function', 'action', 'type', 'id'].includes(bareTagMatch[1].toLowerCase())) {
+    return bareTagMatch[1];
+  }
+
+  const attrMatch = combined.match(/<(?:tool_call[a-z0-9_ -]*|tools|function_call|tool)\b[^>]*\bname\s*=\s*["']([^"']+)["']/i);
   if (attrMatch) return attrMatch[1];
+
+  const funcAttrMatch = combined.match(/(?:<|\b)function\s*=\s*["']?(\w[\w.-]*)["']?/i);
+  if (funcAttrMatch) return funcAttrMatch[1];
 
   const nameTagMatch = block.match(/<name>([\s\S]*?)<\/name>/i);
   if (nameTagMatch) return decodeXmlEntities(nameTagMatch[1].trim());
@@ -213,7 +178,7 @@ function inferToolNameFromParameters(args: Record<string, unknown>, tools: Funct
 }
 
 /**
- * Parse Hermes-style XML <parameter name="...">value</parameter> format.
+ * Parse Hermes-style XML <parameter name="...">value</parameter> format and arbitrary XML child elements.
  */
 function parseXmlParameterToolCall(
   block: string,
@@ -221,10 +186,21 @@ function parseXmlParameterToolCall(
   tools: FunctionToolDefinition[]
 ): { name: string; arguments: Record<string, unknown> } | null {
   const args: Record<string, unknown> = {};
+  
+  // 1. Match <parameter name="...">value</parameter>
   const parameterRe = /<parameter\b[^>]*\bname\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/parameter>/gi;
   let match: RegExpExecArray | null;
   while ((match = parameterRe.exec(block)) !== null) {
     args[match[1]] = coerceParameterValue(match[2]);
+  }
+
+  // 2. Match arbitrary XML child elements: <command>value</command>, <timeout>60000</timeout>, etc.
+  const childTagRe = /<([a-zA-Z_][a-zA-Z0-9_-]*)\b[^>]*>([\s\S]*?)<\/\1>/gi;
+  while ((match = childTagRe.exec(block)) !== null) {
+    const tagName = match[1].toLowerCase();
+    if (!['tool_call', 'tool', 'function', 'parameter', 'name', 'tool_arguments', 'arguments', 'args'].includes(tagName) && !tagName.startsWith('tool_call_')) {
+      args[match[1]] = coerceParameterValue(match[2]);
+    }
   }
 
   if (Object.keys(args).length === 0) return null;
@@ -282,6 +258,8 @@ function matchesCaseInsensitiveAt(buffer: string, index: number, value: string):
   return true;
 }
 
+const CLOSING_TAG_RE = /^<\/(?:tool_call(?:_needed|_request)?|tools|function_call|tool)(?:\s+[^>]*)?>/i;
+
 function findToolEndMatch(buffer: string): { index: number; length: number } | null {
   let inString = false;
   let escaped = false;
@@ -293,12 +271,16 @@ function findToolEndMatch(buffer: string): { index: number; length: number } | n
     if (ch === '"') { inString = !inString; continue; }
     if (inString || ch !== '<') continue;
 
-    if (matchesCaseInsensitiveAt(buffer, i, TOOL_END)) {
-      return { index: i, length: TOOL_END.length };
+    const sub = buffer.substring(i);
+    const closeMatch = sub.match(CLOSING_TAG_RE);
+    if (closeMatch) {
+      return { index: i, length: closeMatch[0].length };
     }
 
-    if (matchesCaseInsensitiveAt(buffer, i, TOOL_SHORT_END)) {
-      return { index: i, length: TOOL_SHORT_END.length };
+    for (const tag of CLOSING_TAGS) {
+      if (matchesCaseInsensitiveAt(buffer, i, tag)) {
+        return { index: i, length: tag.length };
+      }
     }
 
     // Some editor clients append environment metadata immediately after a model
@@ -325,7 +307,11 @@ function findToolEndMatch(buffer: string): { index: number; length: number } | n
 }
 
 function findRecoverableTailEndMatch(buffer: string): { index: number; length: number } | null {
-  for (const tag of [TOOL_END, TOOL_SHORT_END]) {
+  const m = buffer.match(/<\/(?:tool_call(?:_needed|_request)?|tools|function_call|tool)(?:\s+[^>]*)?>\s*$/i);
+  if (m && m.index !== undefined) {
+    return { index: m.index, length: m[0].length };
+  }
+  for (const tag of CLOSING_TAGS) {
     const index = buffer.toLowerCase().lastIndexOf(tag);
     if (index !== -1 && index + tag.length === buffer.length) {
       return { index, length: tag.length };
@@ -349,25 +335,31 @@ function startsWithEnvironmentDetails(buffer: string): boolean {
 const TOOL_START_LITERAL = '<tool_call>';
 
 function findPartialToolOpenIndex(buffer: string): number {
-  const prefix = '<tool_call';
-  const prefixLen = prefix.length;
+  const prefixes = [
+    '<tool_call_needed',
+    '<tool_call_request',
+    '<tool_call',
+    '<tools',
+    '<function_call',
+    '<tool',
+  ];
   const bufLen = buffer.length;
 
-  let lastPartialIdx = -1;
-  for (let i = bufLen - 1; i >= Math.max(0, bufLen - prefixLen - 1); i--) {
-    if (buffer[i] !== '<') continue;
-    let match = true;
-    for (let j = 1; j < prefixLen && i + j < bufLen; j++) {
-      const c = buffer.charCodeAt(i + j);
-      const t = prefix.charCodeAt(j);
-      if (c !== t && ((c | 0x20) !== (t | 0x20))) { match = false; break; }
-    }
-    if (match) {
-      lastPartialIdx = i;
-      break;
+  for (const prefix of prefixes) {
+    const prefixLen = prefix.length;
+    for (let i = bufLen - 1; i >= Math.max(0, bufLen - prefixLen - 1); i--) {
+      if (buffer[i] !== '<') continue;
+      let match = true;
+      for (let j = 1; j < prefixLen && i + j < bufLen; j++) {
+        const c = buffer.charCodeAt(i + j);
+        const t = prefix.charCodeAt(j);
+        if (c !== t && ((c | 0x20) !== (t | 0x20))) { match = false; break; }
+      }
+      if (match && buffer.indexOf('>', i) === -1) {
+        return i;
+      }
     }
   }
-  if (lastPartialIdx !== -1 && buffer.indexOf('>', lastPartialIdx) === -1) return lastPartialIdx;
 
   for (let i = 1; i < TOOL_START_LITERAL.length; i++) {
     const sub = TOOL_START_LITERAL.substring(0, i);
@@ -414,35 +406,7 @@ export class StreamingToolParser {
 
     while (this.buffer.length > 0) {
       if (!this.insideTool) {
-        // PRIMARY: Check for TOOL: name | {json} line format
-        const toolLineResult = parseToolLineFormat(this.buffer);
-        if (toolLineResult && toolLineResult.toolCalls.length > 0) {
-          // Emit preceding non-TOOL text lines
-          const textBlock = this.buffer.substring(0, toolLineResult.consumed);
-          for (const tl of textBlock.split('\n')) {
-            if (!tl.trim().match(/^TOOL:/) && this.emittedToolCallCount === 0) {
-              result.text += tl + '\n';
-            }
-          }
-          for (const tc of toolLineResult.toolCalls) {
-            result.toolCalls.push(tc);
-            this.emittedToolCallCount++;
-          }
-          this.buffer = this.buffer.substring(toolLineResult.consumed);
-          continue;
-        }
-
-        // FALLBACK: Check for XML <tool_call> tags
         if (this.buffer.indexOf('<') === -1) {
-          // Don't flush if buffer looks like a partial TOOL: line
-          const toolPrefix = 'TOOL:';
-          const partialMatch = this.buffer.length < toolPrefix.length
-            ? toolPrefix.startsWith(this.buffer)
-            : this.buffer.trimStart().startsWith(toolPrefix);
-          if (partialMatch) {
-            // Wait for more data to complete the TOOL: line
-            break;
-          }
           if (this.emittedToolCallCount === 0) result.text += this.buffer;
           this.buffer = '';
           break;
@@ -556,6 +520,7 @@ export class StreamingToolParser {
     }
 
     t = unescapeDoubleEscaped(t);
+    t = stripWrapperTags(t);
 
     const xmlParsed = parseXmlParameterToolCall(t, this.currentOpenTag, this.tools);
     if (xmlParsed) {
@@ -588,7 +553,7 @@ export class StreamingToolParser {
     }
 
     // 3) Try JSON object format (single or multiple)
-    if (t.startsWith('{') || t.includes('"name"') || t.includes('tool_calls') || t.includes('function_call')) {
+    if (t.startsWith('{') || t.includes('"name"') || t.includes('tool_calls') || t.includes('function_call') || extractToolName(this.currentOpenTag, t)) {
       const calls = this.parseToolContent(t);
       if (calls.length > 0) {
         for (const tc of calls) {
@@ -619,7 +584,8 @@ export class StreamingToolParser {
   }
 
   private tryRecoverToolCall(block: string): ParsedToolCall | null {
-    const unescaped = unescapeDoubleEscaped(block);
+    let unescaped = unescapeDoubleEscaped(block);
+    unescaped = stripWrapperTags(unescaped);
     
     const xmlParsed = parseXmlParameterToolCall(unescaped, this.currentOpenTag, this.tools);
     if (xmlParsed) {
@@ -652,17 +618,18 @@ export class StreamingToolParser {
 
   private parseToolContent(str: string): ParsedToolCall[] {
     const calls: ParsedToolCall[] = [];
+    const cleaned = stripWrapperTags(str);
     
     // Try parsing as single JSON first
     try {
-      const parsed = robustParseJSON(str);
+      const parsed = robustParseJSON(cleaned);
       if (parsed && typeof parsed === 'object') {
         const tc = this.parseToolCall(parsed);
         if (tc) calls.push(tc);
       }
     } catch { /* ignore */ }
 
-    for (const part of splitTopLevelJsonValues(str)) {
+    for (const part of splitTopLevelJsonValues(cleaned)) {
       try {
         const parsed = robustParseJSON(part);
         const items = Array.isArray(parsed) ? parsed : [parsed];
@@ -676,8 +643,8 @@ export class StreamingToolParser {
     }
     
     // Always try line-by-line parsing for multi-JSON content (independent of single parse)
-    if (str.includes('\n')) {
-      const lines = str.split('\n').map(l => l.trim()).filter(l => l.startsWith('{') && l.endsWith('}'));
+    if (cleaned.includes('\n')) {
+      const lines = cleaned.split('\n').map(l => l.trim()).filter(l => l.startsWith('{') && l.endsWith('}'));
       for (const line of lines) {
         try {
           const parsed = JSON.parse(line);
@@ -710,10 +677,28 @@ export class StreamingToolParser {
       };
     }
     
-    const name = parsed.name || parsed.function?.name || parsed.tool_name || parsed.tool;
+    let name = parsed.name || parsed.function?.name || parsed.tool_name || parsed.tool;
+    if (!name || typeof name !== 'string' || name.length === 0) {
+      name = extractToolName(this.currentOpenTag, '') || inferToolNameFromParameters(parsed, this.tools);
+    }
     if (!name || typeof name !== 'string' || name.length === 0) return null;
     
-    let args = parsed.arguments || parsed.function?.arguments || parsed.args || parsed.parameters || parsed.input || {};
+    let args: any;
+    if (parsed.arguments !== undefined) {
+      args = parsed.arguments;
+    } else if (parsed.function?.arguments !== undefined) {
+      args = parsed.function.arguments;
+    } else if (parsed.args !== undefined) {
+      args = parsed.args;
+    } else if (parsed.parameters !== undefined) {
+      args = parsed.parameters;
+    } else if (parsed.input !== undefined) {
+      args = parsed.input;
+    } else {
+      const { name: _n, function: _f, tool_name: _tn, tool: _t, id: _id, ...rest } = parsed;
+      args = rest;
+    }
+
     if (typeof args === 'string') {
       try { args = robustParseJSON(args) || JSON.parse(args); }
       catch { args = {}; }
