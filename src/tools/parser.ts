@@ -30,6 +30,7 @@ const TOOL_LINE_RE = /^TOOL:\s*(\S+)\s*\|\s*(.+)$/m;
  * Returns parsed tool calls and the consumed length, or null if no complete line found.
  */
 function parseToolLineFormat(buffer: string): { toolCalls: ParsedToolCall[]; consumed: number } | null {
+  // Split on newlines, but also check the last segment (may lack trailing newline)
   const lines = buffer.split('\n');
   const toolCalls: ParsedToolCall[] = [];
   let consumed = 0;
@@ -38,11 +39,23 @@ function parseToolLineFormat(buffer: string): { toolCalls: ParsedToolCall[]; con
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const trimmed = line.trim();
+    const isLast = i === lines.length - 1;
+    const lineLen = line.length + (isLast && !buffer.endsWith('\n') ? 0 : 1);
 
+    // Try matching the TOOL: line format
     const match = trimmed.match(/^TOOL:\s*(\S+)\s*\|\s*(.+)$/);
     if (match) {
       const name = match[1];
       const jsonStr = match[2].trim();
+
+      // Only consume if the JSON looks complete (ends with })
+      const jsonEndsCleanly = jsonStr.endsWith('}');
+      if (!jsonEndsCleanly && isLast) {
+        // Incomplete JSON at end of buffer - wait for more data
+        console.log('[parser:TOOL_INCOMPLETE]', { jsonEnds: jsonStr.slice(-30) });
+        break;
+      }
+
       foundAny = true;
 
       try {
@@ -60,11 +73,12 @@ function parseToolLineFormat(buffer: string): { toolCalls: ParsedToolCall[]; con
         logger.warn('[parser] TOOL: line has invalid JSON', { name, jsonStr: jsonStr.substring(0, 200) });
       }
 
-      consumed += line.length + 1;
+      consumed += lineLen;
     } else if (foundAny) {
+      // Non-TOOL line after TOOL lines - stop consuming
       break;
     } else {
-      consumed += line.length + 1;
+      consumed += lineLen;
     }
   }
 
@@ -420,6 +434,15 @@ export class StreamingToolParser {
 
         // FALLBACK: Check for XML <tool_call> tags
         if (this.buffer.indexOf('<') === -1) {
+          // Don't flush if buffer looks like a partial TOOL: line
+          const toolPrefix = 'TOOL:';
+          const partialMatch = this.buffer.length < toolPrefix.length
+            ? toolPrefix.startsWith(this.buffer)
+            : this.buffer.trimStart().startsWith(toolPrefix);
+          if (partialMatch) {
+            // Wait for more data to complete the TOOL: line
+            break;
+          }
           if (this.emittedToolCallCount === 0) result.text += this.buffer;
           this.buffer = '';
           break;
