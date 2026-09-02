@@ -22,17 +22,9 @@ export { getIncrementalDelta } from './sse-parser.js';
 export type { DeltaResult } from './sse-parser.js';
 
 export async function chatCompletions(c: Context) {
-  const requestId = ((c as any).get('requestId') as string | undefined) || crypto.randomUUID();
-  const requestStartedAt = Date.now();
-  console.log(`[Chat][${requestId}] request_received`, { method: c.req.method, path: c.req.path });
   try {
     const body: OpenAIRequest = await c.req.json();
     const isStream = body.stream ?? false;
-    console.log(`[Chat][${requestId}] request_parsed`, {
-      model: body.model,
-      messageCount: body.messages?.length || 0,
-      stream: isStream,
-    });
     
     let prompt = '';
     const messages = body.messages || [];
@@ -120,28 +112,16 @@ export async function chatCompletions(c: Context) {
     const bodyAny = body as any;
     const hasTools = Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0;
     const toolChoiceMode = getToolChoiceMode(bodyAny.tool_choice);
-    const forcedToolName = getForcedToolName(bodyAny.tool_choice);
-    
-    // Compute candidate tools BEFORE building systemPrompt so we only list
-    // the tools that will actually be sent to the model.
-    const toolContextTextPre = `${systemPrompt}\n${prompt}`;
-    const recentToolNamesPre = hasTools ? getRecentToolNames(messages) : new Set<string>();
-    const candidateTools = hasTools ? selectCandidateTools(bodyAny.tools, toolContextTextPre, forcedToolName, recentToolNamesPre) : [];
-    
     if (hasTools && toolChoiceMode !== 'none') {
-      const formattedTools = candidateTools.map((t: any) => {
-        if (t.type === 'function' && t.function) {
+      const formattedTools = bodyAny.tools.map((t: any) => {
+        if (t.type === 'function') {
           return {
             name: t.function.name,
             description: t.function.description || '',
-            parameters: t.function.parameters || {}
+            parameters: t.function.parameters
           };
         }
-        return {
-          name: t.name || '',
-          description: t.description || '',
-          parameters: t.parameters || {}
-        };
+        return t;
       });
       const toolsJson = JSON.stringify(formattedTools);
       
@@ -156,7 +136,11 @@ export async function chatCompletions(c: Context) {
     const modelId = body.model.replace('-no-thinking', '').replace('-thinking', '');
     const modelContextWindow = getModelContextWindow(modelId)
     const estimatedTokens = estimateTokenCount(systemPrompt + prompt, modelId);
+    const forcedToolName = getForcedToolName(bodyAny.tool_choice);
     const parallelToolCalls = bodyAny.parallel_tool_calls !== false && toolChoiceMode !== 'forced';
+    const toolContextText = `${systemPrompt}\n${prompt}`;
+    const recentToolNames = hasTools ? getRecentToolNames(messages) : new Set<string>();
+    const candidateTools = hasTools ? selectCandidateTools(bodyAny.tools, toolContextText, forcedToolName, recentToolNames) : [];
     
     let finalPrompt: string;
     if (estimatedTokens > modelContextWindow - 1000) {
@@ -187,7 +171,7 @@ export async function chatCompletions(c: Context) {
     let lastError: any = null;
 
     if (isGuestModeOnly) {
-      console.log(`[Chat][${requestId}] account_selected`, { accountId: 'guest', reason: 'guest_mode_only' });
+      console.log('[Chat] Guest mode only enabled. Bypassing account rotation.');
       try {
         const result = await createQwenStream(
           finalPrompt,
@@ -196,8 +180,7 @@ export async function chatCompletions(c: Context) {
           null,
           'guest',
           undefined,
-          pendingMultimodal.length > 0 ? pendingMultimodal : undefined,
-          requestId,
+          pendingMultimodal.length > 0 ? pendingMultimodal : undefined
         );
         stream = result.stream;
         uiSessionId = result.uiSessionId;
@@ -255,7 +238,7 @@ export async function chatCompletions(c: Context) {
           continue;
         }
 
-        console.log(`[Chat][${requestId}] account_selected`, { accountId });
+        console.log(`[Chat] Routing request to account: ${accountEmail} (${accountId})`);
         markAccountInUse(accountId);
 
         let retries = 3;
@@ -272,8 +255,7 @@ export async function chatCompletions(c: Context) {
                 null,
                 accountId === 'global' ? undefined : accountId,
                 undefined,
-                pendingMultimodal.length > 0 ? pendingMultimodal : undefined,
-                requestId,
+                pendingMultimodal.length > 0 ? pendingMultimodal : undefined
               );
               stream = result.stream;
               uiSessionId = result.uiSessionId;
@@ -352,8 +334,7 @@ export async function chatCompletions(c: Context) {
             null,
             'guest',
             undefined,
-            pendingMultimodal.length > 0 ? pendingMultimodal : undefined,
-            requestId,
+            pendingMultimodal.length > 0 ? pendingMultimodal : undefined
           );
           stream = result.stream;
           uiSessionId = result.uiSessionId;
@@ -374,11 +355,9 @@ export async function chatCompletions(c: Context) {
     }
 
     if (!isStream) {
-      console.log(`[Chat][${requestId}] upstream_stream_ready`, { completionId, mode: 'non_stream', elapsedMs: Date.now() - requestStartedAt });
-      return handleNonStreamingResponse(c, stream!, completionId, body.model, uiSessionId, hasTools && toolChoiceMode !== 'none', bodyAny.tools || [], requestId);
+      return handleNonStreamingResponse(c, stream!, completionId, body.model, uiSessionId, hasTools && toolChoiceMode !== 'none', bodyAny.tools || []);
     }
 
-    console.log(`[Chat][${requestId}] upstream_stream_ready`, { completionId, mode: 'stream', elapsedMs: Date.now() - requestStartedAt });
     return handleStreamingResponse(c, {
       stream: stream!,
       completionId,
@@ -387,11 +366,10 @@ export async function chatCompletions(c: Context) {
       hasTools: hasTools && toolChoiceMode !== 'none',
       tools: bodyAny.tools || [],
       finalPrompt,
-      streamOptions: body.stream_options,
-      requestId,
+      streamOptions: body.stream_options
     });
   } catch (err: any) {
-    console.error(`[Chat][${requestId}] request_error:`, err)
+    console.error('Error in chatCompletions:', err)
     const status = err.upstreamStatus || 500
     if (status >= 500) {
       metrics.increment('requests.errors')
