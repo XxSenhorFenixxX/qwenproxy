@@ -52,7 +52,6 @@ function parseToolLineFormat(buffer: string): { toolCalls: ParsedToolCall[]; con
       const jsonEndsCleanly = jsonStr.endsWith('}');
       if (!jsonEndsCleanly && isLast) {
         // Incomplete JSON at end of buffer - wait for more data
-        console.log('[parser:TOOL_INCOMPLETE]', { jsonEnds: jsonStr.slice(-30) });
         break;
       }
 
