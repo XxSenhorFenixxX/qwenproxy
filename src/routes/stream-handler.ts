@@ -116,7 +116,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       // lightweight manual escaper instead of JSON.stringify().slice() on every chunk.
       const contentPrefix = `data: {"id":"${ctx.completionId}","object":"chat.completion.chunk","created":${createdTimestamp},"model":${JSON.stringify(ctx.model)},"choices":[{"index":0,"delta":{"content":"`;
       const reasoningPrefix = `data: {"id":"${ctx.completionId}","object":"chat.completion.chunk","created":${createdTimestamp},"model":${JSON.stringify(ctx.model)},"choices":[{"index":0,"delta":{"reasoning_content":"`;
-      const chunkSuffix = `"},"logprobs":null,"finish_reason":null}]\n\n`;
+      const chunkSuffix = `"},"logprobs":null,"finish_reason":null}]}\n\n`;
 
       // Detects chars that need JSON string escaping: backslash, double-quote, and
       // control characters (U+0000–U+001F). Control chars are intentionally matched.
