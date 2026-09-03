@@ -433,14 +433,16 @@ export class StreamingToolParser {
 
         // FALLBACK: Check for XML <tool_call> tags
         // Never flush an in-progress TOOL: line as text — its JSON can contain
-        // '<' (Python/HTML code), which must not trigger the XML fallback below
-        // and leak the partial line. Wait for the line to complete instead.
-        const toolPrefix = 'TOOL:';
-        const partialMatch = this.buffer.length < toolPrefix.length
-          ? toolPrefix.startsWith(this.buffer)
-          : this.buffer.trimStart().startsWith(toolPrefix);
-        if (partialMatch) {
-          // Wait for more data to complete the TOOL: line
+        // '<' (Python/HTML code) or be preceded by prose in the same chunk,
+        // which must not trigger the XML fallback below and leak the line.
+        // Hold the partial TOOL tail; emit only the text that precedes it.
+        const lastNl = this.buffer.lastIndexOf('\n');
+        const tail = lastNl === -1 ? this.buffer : this.buffer.substring(lastNl + 1);
+        if (tail.trimStart().startsWith('TOOL:')) {
+          if (lastNl > 0 && this.emittedToolCallCount === 0) {
+            result.text += this.buffer.substring(0, lastNl + 1);
+          }
+          this.buffer = lastNl === -1 ? this.buffer : this.buffer.substring(lastNl + 1);
           break;
         }
         if (this.buffer.indexOf('<') === -1) {
