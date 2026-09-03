@@ -146,7 +146,21 @@ export class Metrics extends EventEmitter {
         const labelsStr = point.labels
           ? `{${Object.entries(point.labels).map(([k, v]) => `${k}="${v}"`).join(',')}}`
           : ''
-        output += `${metric.name}${labelsStr} ${point.value} ${point.timestamp}\n`
+
+        if (metric.type === 'histogram' && point.value && typeof point.value === 'object') {
+          // Serialize the histogram object ({count, sum, buckets}) in the
+          // standard Prometheus exposition format instead of printing
+          // "[object Object]" (which made /metrics latency unreadable).
+          const data = point.value as { count: number; sum: number; buckets: Map<number, number> }
+          for (const [bucket, count] of (data.buckets ?? new Map()).entries()) {
+            output += `${metric.name}_bucket${labelsStr ? labelsStr.slice(0, -1) + ',le="' + bucket + '"}' : `{le="${bucket}"}`} ${count} ${point.timestamp}\n`
+          }
+          output += `${metric.name}_bucket${labelsStr ? labelsStr.slice(0, -1) + ',le="+Inf"}' : '{le="+Inf"}'} ${data.count ?? 0} ${point.timestamp}\n`
+          output += `${metric.name}_sum${labelsStr} ${data.sum ?? 0} ${point.timestamp}\n`
+          output += `${metric.name}_count${labelsStr} ${data.count ?? 0} ${point.timestamp}\n`
+        } else {
+          output += `${metric.name}${labelsStr} ${point.value} ${point.timestamp}\n`
+        }
       }
     }
     return output

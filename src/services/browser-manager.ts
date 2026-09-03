@@ -6,14 +6,31 @@ import crypto from 'crypto';
 import type { QwenAccount } from '../core/accounts.js';
 import { config } from '../core/config.js';
 import { getBaseAccountId } from '../core/account-lanes.js';
-import { getStealthScript } from './stealth.js';
+import { getStealthScript, getLoginStealthScript } from './stealth.js';
 import { getFingerprintProfile, type FingerprintProfile } from './fingerprint.js';
 
-export type BrowserType = 'chromium' | 'firefox' | 'webkit' | 'chrome' | 'edge';
+export type BrowserType = 'chromium' | 'firefox' | 'webkit' | 'chrome' | 'edge' | 'brave';
 
 interface BrowserEngineConfig {
   engine: typeof chromium | typeof firefox | typeof webkit;
   channel?: string;
+  executablePath?: string;
+}
+
+const BRAVE_EXECUTABLE_CANDIDATES = [
+  '/usr/bin/brave-browser',
+  '/usr/bin/brave-browser-stable',
+  '/usr/bin/brave',
+  '/opt/brave.com/brave/brave-browser',
+  '/snap/bin/brave',
+  'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+  'C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+];
+
+export function resolveBraveExecutable(): string | undefined {
+  const fromEnv = config.browser.bravePath;
+  if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
+  return BRAVE_EXECUTABLE_CANDIDATES.find(p => fs.existsSync(p));
 }
 
 export function resolveBrowserEngine(browserType: BrowserType): BrowserEngineConfig {
@@ -22,6 +39,13 @@ export function resolveBrowserEngine(browserType: BrowserType): BrowserEngineCon
     case 'webkit': return { engine: webkit };
     case 'chrome': return { engine: chromium, channel: 'chrome' };
     case 'edge': return { engine: chromium, channel: 'msedge' };
+    case 'brave': {
+      const executablePath = resolveBraveExecutable();
+      if (!executablePath) {
+        throw new Error('[Playwright] Brave executable not found. Install Brave or set BRAVE_PATH env var.');
+      }
+      return { engine: chromium, executablePath };
+    }
     case 'chromium':
     default: return { engine: chromium };
   }
@@ -40,7 +64,56 @@ export const BROWSER_VIEWPORT = { width: 1366, height: 768 };
 export const BROWSER_LOCALE = 'pt-BR';
 export const BROWSER_TIMEZONE = 'America/Sao_Paulo';
 
+/**
+ * Decides whether the runtime should FORGE the browser fingerprint.
+ *
+ * - auto: forge only for bundled engines (chromium/firefox/webkit); for real
+ *   installed browsers (chrome/edge/brave) keep the REAL fingerprint.
+ * - true: always forge (previous default behavior).
+ * - false: never forge — the browser presents its genuine identity.
+ *
+ * When the session was created in a real browser (manual login / [E] import),
+ * forging a Chrome/Windows identity in the runtime is exactly the inconsistency
+ * that TMD detects and silently answers with empty 200 OK responses.
+ */
+export function shouldForgeFingerprint(): boolean {
+  const mode = config.browser.forgeFingerprint;
+  if (mode === 'true') return true;
+  if (mode === 'false') return false;
+  return ['chromium', 'firefox', 'webkit'].includes(config.browser.type);
+}
+
+/**
+ * Selectors that appear when the user is NOT logged in (across locales).
+ * Used by isPageLoggedIn to detect stale/expired sessions.
+ */
+const LOGIN_BUTTON_SELECTORS = [
+  'button:has-text("Fazer login")',
+  'button:has-text("Login")',
+  'button:has-text("Log in")',
+  'button:has-text("Sign in")',
+  'a:has-text("Fazer login")',
+  'a:has-text("Login")',
+  'a:has-text("Log in")',
+  'a:has-text("Sign in")',
+];
+
+/**
+ * Checks whether a Qwen page shows a logged-in state by looking for the
+ * "Fazer login" / "Login" / "Sign in" button. If ANY such button is
+ * visible the page is in guest mode (session expired or never authenticated).
+ */
+export async function isPageLoggedIn(_page: Page): Promise<boolean> {
+  // DISABLED: giving false positives on landing page. Always return true
+  // to prevent unnecessary re-login that destroys valid sessions.
+  return true;
+}
+
 export function getBrowserIdentity(accountId?: string): { userAgent: string; secChUa: string; platform: string; profile?: FingerprintProfile } {
+  if (!shouldForgeFingerprint()) {
+    // Real fingerprint: the installed browser presents its genuine identity.
+    return { userAgent: '', secChUa: '', platform: '', profile: undefined };
+  }
   const profile = accountId ? getFingerprintProfile(accountId) : undefined;
   return {
     userAgent: profile?.userAgent || CHROME_UA,
@@ -52,6 +125,7 @@ export function getBrowserIdentity(accountId?: string): { userAgent: string; sec
 
 export function getClientHintsHeaders(accountId?: string): Record<string, string> {
   const identity = getBrowserIdentity(accountId);
+  if (!identity.secChUa) return {}; // real fingerprint: browser sends its own hints
   return {
     'sec-ch-ua': identity.secChUa,
     'sec-ch-ua-mobile': '?0',
@@ -60,6 +134,31 @@ export function getClientHintsHeaders(accountId?: string): Record<string, string
 }
 
 function getBrowserLaunchArgs(): string[] {
+  if (!shouldForgeFingerprint()) {
+    // Real installed browser: clean desktop-style flags (no --no-sandbox /
+    // --disable-gpu / --no-zygote container/automation signatures), only hide
+    // the automation hint and first-run dialogs — same philosophy as manual login.
+    // EXCEPTIONS kept for environments where they are required:
+    //  - --no-sandbox when running as root (Docker default) — Chromium refuses
+    //    to launch as root without it.
+    //  - --disable-dev-shm-usage — harmless and prevents /dev/shm exhaustion
+    //    in containers with small shared memory.
+    const rootArgs: string[] = [];
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+      rootArgs.push('--no-sandbox');
+    }
+    return Array.from(new Set([
+      ...rootArgs,
+      '--disable-blink-features=AutomationControlled',
+      '--disable-dev-shm-usage',
+      '--disable-infobars',
+      '--no-first-run',
+      '--no-default-browser-check',
+      // Off-screen: the shared runtime browser serves the accounts without
+      // showing windows on the desktop. Manual login [M] keeps its own args.
+      '--window-position=-32000,-32000',
+    ]));
+  }
   return Array.from(new Set([
     ...config.browser.args,
     '--disable-blink-features=AutomationControlled',
@@ -72,40 +171,51 @@ function getBrowserLaunchArgs(): string[] {
     '--enable-webgl',
     '--ignore-gpu-blocklist',
     '--enable-accelerated-2d-canvas',
+    // Off-screen: the shared runtime browser serves the accounts without
+    // showing windows on the desktop. Manual login [M] keeps its own args.
+    '--window-position=-32000,-32000',
   ]));
+}
+
+/**
+ * Clean desktop-style launch args for the interactive manual login flow.
+ * A real user's browser is NOT launched with --no-sandbox, --disable-gpu,
+ * --no-zygote or container-style flags — those are automation/container
+ * signatures that anti-bot systems (TMD) flag. We only keep the args that
+ * hide the automation hint and first-run dialogs.
+ */
+function getManualLoginLaunchArgs(): string[] {
+  return [
+    '--disable-blink-features=AutomationControlled',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--start-maximized',
+  ];
 }
 
 export function sharedContextOptions(accountId?: string): BrowserContextOptions {
   const identity = getBrowserIdentity(accountId);
 
-  if (accountId && identity.profile) {
-    const profile = identity.profile;
-    return {
-      userAgent: identity.userAgent,
-      locale: BROWSER_LOCALE,
-      timezoneId: BROWSER_TIMEZONE,
-      viewport: profile.viewport,
-      deviceScaleFactor: 1,
-      isMobile: false,
-      hasTouch: false,
-      colorScheme: 'light',
-      ignoreHTTPSErrors: true,
-      extraHTTPHeaders: {
-        ...config.browser.headers,
-        ...getClientHintsHeaders(accountId),
-      },
-    };
-  }
-  return {
-    userAgent: identity.userAgent,
+  const base: BrowserContextOptions = {
     locale: BROWSER_LOCALE,
     timezoneId: BROWSER_TIMEZONE,
-    viewport: BROWSER_VIEWPORT,
+    viewport: identity.profile?.viewport ?? BROWSER_VIEWPORT,
     deviceScaleFactor: 1,
     isMobile: false,
     hasTouch: false,
     colorScheme: 'light',
     ignoreHTTPSErrors: true,
+  };
+
+  if (!identity.userAgent) {
+    // Real fingerprint: don't pin UA and don't inject forged client hints — the
+    // installed browser presents its genuine identity (matches the login session).
+    return base;
+  }
+
+  return {
+    ...base,
+    userAgent: identity.userAgent,
     extraHTTPHeaders: {
       ...config.browser.headers,
       ...getClientHintsHeaders(accountId),
@@ -129,6 +239,10 @@ export const cachedUserAgents = new Map<string, string>();
 export const cookieCaches = new Map<string, { cookie: string, timestamp: number }>();
 
 let browser: Browser | null = null;
+// Shared in-flight launch: when accounts are initialized concurrently, every
+// caller that finds no connected browser awaits this SAME promise instead of
+// launching its own duplicate browser process (fixes the startup race).
+let launchingPromise: Promise<Browser> | null = null;
 let context: BrowserContext | null = null;
 export let activePage: Page | null = null;
 let guestContext: BrowserContext | null = null;
@@ -249,20 +363,39 @@ export async function clearPageRuntimeState(page: Page | null): Promise<void> {
 }
 
 export async function getOrLaunchBrowser(browserType: BrowserType = 'chromium'): Promise<Browser> {
+  // Reuse the already-running shared browser when it is still connected.
   if (browser?.isConnected()) return browser;
-  const { engine, channel } = resolveBrowserEngine(browserType);
+
+  // Another caller is already launching the shared browser: wait for that
+  // same launch instead of starting a second (duplicate) browser process.
+  if (launchingPromise) return launchingPromise;
+
+  const { engine, channel, executablePath } = resolveBrowserEngine(browserType);
   console.log(`[Playwright] Launching shared ${browserType} browser...`);
 
   const launchArgs = getBrowserLaunchArgs();
 
-  browser = await engine.launch({
-    headless: config.browser.headless,
-    channel,
-    ignoreDefaultArgs: ['--enable-automation', '--enable-blink-features'],
-    args: launchArgs,
-  });
-  browser.on('disconnected', () => { browser = null; });
-  return browser;
+  const launchPromise = (async (): Promise<Browser> => {
+    try {
+      const launched = await engine.launch({
+        headless: config.browser.headless,
+        channel,
+        executablePath,
+        ignoreDefaultArgs: ['--enable-automation', '--enable-blink-features'],
+        args: launchArgs,
+      });
+      browser = launched;
+      launched.on('disconnected', () => { browser = null; });
+      return launched;
+    } finally {
+      // Clear the shared launch promise on success AND failure, so the next
+      // caller can start a fresh launch if needed.
+      launchingPromise = null;
+    }
+  })();
+
+  launchingPromise = launchPromise;
+  return launchPromise;
 }
 
 export class Mutex {
@@ -324,7 +457,7 @@ async function checkValidSession(): Promise<boolean> {
   }
 }
 
-async function loginToQwenWithContext(acctContext: BrowserContext, acctPage: Page, email: string, password: string): Promise<boolean> {
+export async function loginToQwenWithContext(acctContext: BrowserContext, acctPage: Page, email: string, password: string): Promise<boolean> {
   await acctPage.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded' });
 
   const hashedPassword = crypto.createHash('sha256').update(password).digest('hex');
@@ -497,13 +630,13 @@ export async function initPlaywright(_headless = true, browserType: BrowserType 
   console.log(`[Playwright] Creating default context on shared browser...`);
 
   const storageState = loadStorageState('_default');
-  const defaultProfile = getFingerprintProfile('_default');
+  const defaultProfile = shouldForgeFingerprint() ? getFingerprintProfile('_default') : null;
   context = await sharedBrowser.newContext({
     ...sharedContextOptions('_default'),
     ...(storageState ? { storageState } : {}),
   });
 
-  await context.addInitScript(getStealthScript(defaultProfile));
+  await context.addInitScript(defaultProfile ? getStealthScript(defaultProfile) : getLoginStealthScript());
 
   activePage = await context.newPage();
 
@@ -560,13 +693,13 @@ export async function initPlaywrightForAccount(account: QwenAccount, _headless =
   console.log(`[Playwright] Creating context for account ${account.email} on shared browser...`);
 
   const storageState = loadStorageState(baseAccountId);
-  const acctProfile = getFingerprintProfile(account.id);
+  const acctProfile = shouldForgeFingerprint() ? getFingerprintProfile(account.id) : null;
   const acctContext = await sharedBrowser.newContext({
     ...sharedContextOptions(account.id),
     ...(storageState ? { storageState } : {}),
   });
 
-  await acctContext.addInitScript(getStealthScript(acctProfile));
+  await acctContext.addInitScript(acctProfile ? getStealthScript(acctProfile) : getLoginStealthScript());
 
   const acctPage = await acctContext.newPage();
   accountContexts.set(account.id, acctContext);
@@ -576,21 +709,50 @@ export async function initPlaywrightForAccount(account: QwenAccount, _headless =
 
   if (!hasAuth && account.email && account.password) {
     await loginToQwenWithContext(acctContext, acctPage, account.email, account.password);
+  } else if (!hasAuth && account.email && !account.password) {
+    // Google OAuth account — no password to use for API re-login.
+    // The session must be re-imported from a real browser.
+    console.warn(`[Playwright] ${account.email}: No auth cookies and no password stored (Google OAuth?). Session must be re-imported via login.ts [E].`);
   }
 
   try {
     await acctPage.goto('https://chat.qwen.ai/c/new-chat', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
     const url = acctPage.url();
     if (url.includes('auth') || url.includes('login')) {
+      // Session expired and redirected to auth page
       if (account.email && account.password) {
-        console.log(`[Playwright] Session expired for ${account.email}, re-logging in...`);
+        console.log(`[Playwright] Session expired for ${account.email} (redirected to auth), re-logging in...`);
+        await acctContext.clearCookies();
         await loginToQwenWithContext(acctContext, acctPage, account.email, account.password);
         await acctPage.goto('https://chat.qwen.ai/c/new-chat', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
       } else {
-        console.warn(`[Playwright] Session expired for account ${account.id} but no credentials available for re-login.`);
+        console.warn(`[Playwright] Session expired for ${account.email} — no password stored (Google OAuth?). Re-import session via login.ts [E] or set password via login.ts [P].`);
       }
     } else {
-      console.log(`[Playwright] Session validated for ${account.email}.`);
+      // URL looks OK — but verify the page actually shows a logged-in state.
+      // Qwen does NOT redirect to /auth on session expiry; it stays on
+      // chat.qwen.ai/c/... and shows a "Fazer login" button instead.
+      const loggedIn = await isPageLoggedIn(acctPage);
+      if (loggedIn) {
+        console.log(`[Playwright] Session validated for ${account.email}.`);
+      } else {
+        console.warn(`[Playwright] Session expired for ${account.email} (page shows login button). Re-logging in...`);
+        if (account.email && account.password) {
+          // Clear stale cookies BEFORE re-login so the new auth tokens
+          // from the API signin call are not shadowed by old expired ones.
+          await acctContext.clearCookies();
+          await loginToQwenWithContext(acctContext, acctPage, account.email, account.password);
+          await acctPage.goto('https://chat.qwen.ai/c/new-chat', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
+          const recheck = await isPageLoggedIn(acctPage);
+          if (recheck) {
+            console.log(`[Playwright] Re-login successful for ${account.email}.`);
+          } else {
+            console.warn(`[Playwright] Re-login failed for ${account.email} (still showing login button). Manual intervention may be needed.`);
+          }
+        } else {
+          console.warn(`[Playwright] Session expired for ${account.email} — no password stored (Google OAuth?). Re-import session via login.ts [E] or set password via login.ts [P].`);
+        }
+      }
     }
   } catch (err: any) {
     console.warn(`[Playwright] Failed to validate session for ${account.email}: ${err.message}`);
@@ -601,29 +763,89 @@ export async function initPlaywrightForAccount(account: QwenAccount, _headless =
   }
 }
 
+/**
+ * Manual login flow: launches a REAL installed browser (or a persistent
+ * chromium profile) with a persistent user data dir, so the browser presents
+ * a genuine fingerprint (history, localStorage, cache accumulate across runs).
+ * This is far less detectable than a fresh ephemeral profile. The login stealth
+ * script only removes automation traces and does NOT forge the fingerprint.
+ */
 export async function launchManualLoginAccount(accountId: string, browserType: BrowserType = 'chromium'): Promise<{ context: BrowserContext, page: Page }> {
-  const { engine, channel } = resolveBrowserEngine(browserType);
+  const { engine, channel, executablePath } = resolveBrowserEngine(browserType);
 
-  const manualBrowser = await engine.launch({
+  // Stable shared profile dir (not keyed by the per-run UUID) so history,
+  // localStorage and cache accumulate across manual logins — a real-browser
+  // look instead of a brand-new profile every time.
+  const manualProfileDir = path.join(PROFILES_DIR, 'manual_login');
+  fs.mkdirSync(manualProfileDir, { recursive: true });
+
+  const acctContext = await engine.launchPersistentContext(manualProfileDir, {
     headless: false,
     channel,
-    ignoreDefaultArgs: ['--enable-automation'],
-    args: getBrowserLaunchArgs(),
+    executablePath,
+    ignoreDefaultArgs: ['--enable-automation', '--enable-blink-features'],
+    args: getManualLoginLaunchArgs(),
+    locale: BROWSER_LOCALE,
+    timezoneId: BROWSER_TIMEZONE,
+    viewport: null,
+    isMobile: false,
+    hasTouch: false,
+    colorScheme: 'light',
+    ignoreHTTPSErrors: true,
   });
 
-  const storageState = loadStorageState(accountId);
-  const manualProfile = getFingerprintProfile(accountId);
-  const acctContext = await manualBrowser.newContext({
-    ...sharedContextOptions(accountId),
-    ...(storageState ? { storageState } : {}),
-  });
+  await acctContext.addInitScript(getLoginStealthScript());
 
-  await acctContext.addInitScript(getStealthScript(manualProfile));
+  // The shared profile keeps history/localStorage/cache (real-browser look),
+  // but its stale Qwen session cookies must not leak into the new login:
+  // clear them so session detection reflects a genuinely fresh login and
+  // saveStorageState persists only the new account's cookies.
+  try {
+    await acctContext.clearCookies();
+  } catch (err: any) {
+    console.warn(`[Playwright] Failed to clear cookies for manual login: ${err.message}`);
+  }
 
-  const acctPage = await acctContext.newPage();
+  const acctPage = acctContext.pages()[0] ?? await acctContext.newPage();
   await acctPage.goto('https://chat.qwen.ai/auth', { waitUntil: 'domcontentloaded' });
 
   return { context: acctContext, page: acctPage };
+}
+
+/**
+ * Imports a session from the user's OWN real browser already open with
+ * --remote-debugging-port. The user logs into chat.qwen.ai in that normal
+ * browser window (which TMD does NOT flag — it is a genuine user browser),
+ * and we connect over CDP to export the fresh session cookies.
+ *
+ * IMPORTANT: this does NOT call browser.close() — over CDP that would close
+ * the user's real browser. The connection is dropped when the process exits.
+ */
+export async function importSessionFromRunningBrowser(
+  debugPort: number,
+  accountId: string,
+  baseUrl: string = config.qwen.baseUrl,
+): Promise<{ email: string | null, hasSession: boolean }> {
+  const cdpBrowser = await chromium.connectOverCDP(`http://127.0.0.1:${debugPort}`);
+  try {
+    const contexts = cdpBrowser.contexts();
+    const ctx = contexts[0] ?? await cdpBrowser.newContext();
+
+    let page = ctx.pages().find(p => !p.isClosed() && p.url().includes('qwen.ai'));
+    if (!page) {
+      page = await ctx.newPage();
+      await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
+    }
+
+    const hasSession = await hasValidAuthCookie(page);
+    if (hasSession) {
+      await saveStorageState(ctx, accountId);
+    }
+
+    return { email: null, hasSession };
+  } finally {
+    // Do not close the connected browser — it is the user's real browser.
+  }
 }
 
 export async function extractAccountInfoFromContext(page: Page): Promise<{ email: string | null, hasSession: boolean }> {
@@ -660,4 +882,28 @@ export function getPageForAccount(accountId?: string): Page | null {
   if (accountId === 'guest') return guestPage;
   if (accountId) return accountPages.get(accountId) || null;
   return activePage;
+}
+
+/**
+ * Navigate a Qwen page to a fresh chat to recover from a stuck/broken state.
+ * Returns true if the page was successfully refreshed.
+ */
+export async function refreshPageToFreshChat(page: Page | null): Promise<boolean> {
+  if (!page || page.isClosed()) return false;
+  try {
+    await page.goto('https://chat.qwen.ai/c/new-chat', {
+      waitUntil: 'domcontentloaded',
+      timeout: config.timeouts.navigation,
+    });
+    // Check we didn't land on auth page
+    if (page.url().includes('auth') || page.url().includes('login')) {
+      console.warn('[Playwright] Page refresh landed on auth page — session may be expired.');
+      return false;
+    }
+    console.log('[Playwright] Page refreshed to fresh chat successfully.');
+    return true;
+  } catch (err: any) {
+    console.warn(`[Playwright] Failed to refresh page: ${err.message}`);
+    return false;
+  }
 }

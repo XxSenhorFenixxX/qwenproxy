@@ -1,6 +1,7 @@
 const modelContextWindows: Record<string, number> = {
   'qwen3.7-plus': 1000000,
   'qwen3.7-max': 1000000,
+  'qwen3.8-max': 1000000,
   'qwen3.6-plus': 1000000,
   'qwen3.6-plus-preview': 1000000,
   'qwen3.6-max-preview': 262144,
@@ -26,6 +27,7 @@ const modelContextWindows: Record<string, number> = {
 
 const modelTokenDivisors: Record<string, number> = {
   'qwen3.7-max': 3.5,
+  'qwen3.8-max': 3.5,
   'qwen3.6-max-preview': 3.5,
   'qwen3.5-max-2026-03-08': 3.5,
   'qwen3-max-2026-01-23': 3.5,

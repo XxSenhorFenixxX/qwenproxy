@@ -1,3 +1,5 @@
+import { classifyErrorStatus } from '../services/error-handler.js';
+
 export interface DeltaResult {
   delta: string;
   matchedContent: string;
@@ -83,26 +85,35 @@ export function getIncrementalDelta(oldStr: string, newStr: string, prevLength: 
   };
 }
 
+/**
+ * Extracts a Qwen error from an already-parsed JSON payload (SSE chunk or full
+ * body). Returns null when the payload is not an error. Shared by the tail-buffer
+ * check and mid-stream chunk inspection so every error surface is detected once.
+ */
+export function parseQwenErrorObject(payload: any): { message: string; status: number } | null {
+  if (!payload || typeof payload !== 'object') return null;
+
+  if (payload.success === false) {
+    const code = payload.data?.code || payload.code || 'UpstreamError';
+    const details = payload.data?.details || payload.message || 'Qwen returned an error';
+    const wait = payload.data?.num !== undefined ? ` Wait about ${payload.data.num} hour(s) before trying again.` : '';
+    return { message: `Qwen upstream error: ${code}: ${details}.${wait}`, status: classifyErrorStatus(code) };
+  }
+  if (payload.error) {
+    const msg = typeof payload.error === 'string' ? payload.error : (payload.error.message || JSON.stringify(payload.error));
+    return { message: `Qwen upstream error: ${msg}`, status: 502 };
+  }
+
+  return null;
+}
+
 export function parseQwenErrorPayload(raw: string): { message: string; status: number } | null {
   const text = raw.trim();
   if (!text || text.startsWith('data: ')) return null;
 
   try {
-    const payload = JSON.parse(text);
-    if (payload && payload.success === false) {
-      const code = payload.data?.code || payload.code || 'UpstreamError';
-      const details = payload.data?.details || payload.message || 'Qwen returned an error';
-      const wait = payload.data?.num !== undefined ? ` Wait about ${payload.data.num} hour(s) before trying again.` : '';
-      const status = code === 'RateLimited' ? 429 : (code === 'Not_Found' ? 404 : 502);
-      return { message: `Qwen upstream error: ${code}: ${details}.${wait}`, status };
-    }
-    if (payload && payload.error) {
-      const msg = typeof payload.error === 'string' ? payload.error : (payload.error.message || JSON.stringify(payload.error));
-      return { message: `Qwen upstream error: ${msg}`, status: 502 };
-    }
+    return parseQwenErrorObject(JSON.parse(text));
   } catch {
     return { message: `Qwen upstream returned non-SSE response: ${text.slice(0, 300)}`, status: 502 };
   }
-
-  return null;
 }

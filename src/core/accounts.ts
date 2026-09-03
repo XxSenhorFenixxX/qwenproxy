@@ -85,6 +85,19 @@ export function getAccountCredentials(id: string): QwenAccount | undefined {
   return cached.find(a => a.id === id)
 }
 
+export function updateAccountPassword(id: string, newPassword: string): boolean {
+  if (!newPassword || typeof newPassword !== 'string') {
+    throw new Error('Password is required')
+  }
+  const db = getDatabase()
+  const existing = db.prepare('SELECT id FROM accounts WHERE id = ?').get(id)
+  if (!existing) return false
+  const encryptedPassword = encrypt(newPassword)
+  db.prepare('UPDATE accounts SET password = ? WHERE id = ?').run(encryptedPassword, id)
+  invalidateAccountsCache()
+  return true
+}
+
 export function updateAccountCooldown(id: string, cooldownUntil: number, reason: string | null): void {
   const db = getDatabase()
   db.prepare('UPDATE accounts SET cooldown_until = ?, cooldown_reason = ? WHERE id = ?').run(cooldownUntil, reason, id)

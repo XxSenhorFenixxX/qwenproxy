@@ -7,6 +7,7 @@
 import type { Context } from "hono";
 import type OSSType from "ali-oss";
 import { getQwenHeaders } from "../services/playwright.js";
+import { config } from "../core/config.js";
 import crypto from "crypto";
 
 interface STSResponse {
@@ -25,9 +26,41 @@ interface STSResponse {
   };
 }
 
+// Qwen rate-limits the getstsToken endpoint ("Too many requests in a short
+// period") when uploads fire back-to-back: a single multimodal message can
+// produce several uploads, and concurrent requests across account lanes hit
+// the endpoint in parallel. Serialize STS token requests with a minimum
+// interval and retry with backoff on RateLimited so bursts get smoothed out.
+const STS_MIN_INTERVAL_MS = Math.max(100, Number(process.env.STS_MIN_INTERVAL_MS || 400));
+const STS_MAX_RETRIES = 3;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+let stsChain: Promise<void> = Promise.resolve();
+let lastStsRequestAt = 0;
+
+/**
+ * Run an STS request through a global queue so no two getstsToken calls hit
+ * Qwen within STS_MIN_INTERVAL_MS of each other (across all accounts).
+ */
+function serializeStsRequest<T>(fn: () => Promise<T>): Promise<T> {
+  const run = stsChain.then(async () => {
+    const wait = Math.max(0, lastStsRequestAt + STS_MIN_INTERVAL_MS - Date.now());
+    if (wait > 0) await sleep(wait);
+    lastStsRequestAt = Date.now();
+    return fn();
+  });
+  stsChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+function isRateLimitedPayload(data: any): boolean {
+  const code = String(data?.data?.code ?? data?.code ?? '').toLowerCase();
+  const details = String(data?.data?.details ?? data?.message ?? '').toLowerCase();
+  return code === "ratelimited" || details.includes("too many requests");
+}
+
 /**
  * Get STS token from Qwen for file upload
- * Retries once with refreshed headers if 401/RateLimited
+ * Retries with backoff on RateLimited, and refreshes headers on 401
  */
 async function getSTSToken(
   filename: string,
@@ -35,64 +68,82 @@ async function getSTSToken(
   filetype: string,
   headers: Record<string, string>,
 ): Promise<STSResponse["data"]> {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const response = await fetch(
-      "https://chat.qwen.ai/api/v2/files/getstsToken",
-      {
-        method: "POST",
-        headers: {
-          Accept: "application/json, text/plain, */*",
-          "Content-Type": "application/json",
-          Cookie: headers.cookie,
-          Origin: "https://chat.qwen.ai",
-          Referer: "https://chat.qwen.ai/",
-          "User-Agent": headers["user-agent"],
-          "X-Request-Id": crypto.randomUUID(),
-          "bx-ua": headers["bx-ua"],
-          "bx-umidtoken": headers["bx-umidtoken"],
-          "bx-v": headers["bx-v"],
+  for (let attempt = 0; attempt <= STS_MAX_RETRIES; attempt++) {
+    const outcome = await serializeStsRequest(async () => {
+      // All uploads are serialized through one queue: a hung request would
+      // block every upload forever, so always bound the STS fetch.
+      const response = await fetch(
+        "https://chat.qwen.ai/api/v2/files/getstsToken",
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            Cookie: headers.cookie,
+            Origin: "https://chat.qwen.ai",
+            Referer: "https://chat.qwen.ai/",
+            "User-Agent": headers["user-agent"],
+            "X-Request-Id": crypto.randomUUID(),
+            "bx-ua": headers["bx-ua"],
+            "bx-umidtoken": headers["bx-umidtoken"],
+            "bx-v": headers["bx-v"],
+          },
+          body: JSON.stringify({ filename, filesize: String(filesize), filetype }),
+          signal: AbortSignal.timeout(config.timeouts.http),
         },
-        body: JSON.stringify({ filename, filesize: String(filesize), filetype }),
-      },
-    );
-
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => "");
-      // On 401, try refreshing headers once
-      if (response.status === 401 && attempt === 0) {
-        console.warn("[Upload] STS 401, refreshing headers and retrying...");
-        const refreshed = await refreshUploadHeaders();
-        if (refreshed) {
-          Object.assign(headers, refreshed);
-          continue;
-        }
-      }
-      throw new Error(
-        `STS token request failed: ${response.status} ${errorText.substring(0, 200)}`,
       );
+
+      if (!response.ok) {
+        return {
+          ok: false as const,
+          status: response.status,
+          error: new Error(
+            `STS token request failed: ${response.status} ${(await response.text().catch(() => "")).substring(0, 200)}`,
+          ),
+        };
+      }
+
+      const data = await response.json();
+      if (data.success && data.data) {
+        return { ok: true as const, data: data.data as STSResponse["data"] };
+      }
+
+      return {
+        ok: false as const,
+        status: response.status,
+        payload: data as any,
+        error: new Error(`STS token invalid: ${JSON.stringify(data).substring(0, 200)}`),
+      };
+    });
+
+    if (outcome.ok) return outcome.data;
+
+    // 401 / Unauthorized -> session headers are stale; refresh once and retry.
+    const payload = (outcome as any).payload;
+    const details = String(payload?.data?.details ?? payload?.message ?? "");
+    const isAuthFailure =
+      outcome.status === 401 ||
+      (payload?.code === "RateLimited" && details.includes("401")) ||
+      details.includes("Unauthorized");
+
+    if (isAuthFailure && attempt < STS_MAX_RETRIES) {
+      console.warn("[Upload] STS 401, refreshing headers and retrying...");
+      const refreshed = await refreshUploadHeaders();
+      if (refreshed) {
+        Object.assign(headers, refreshed);
+        continue;
+      }
     }
 
-    const data = await response.json();
-    if (!data.success || !data.data) {
-      // Check if it's a 401/RateLimited error inside the response body
-      const code = data.data?.code || data.code;
-      const details = data.data?.details || data.message || "";
-      if ((code === "RateLimited" && details.includes("401")) || details.includes("Unauthorized")) {
-        if (attempt === 0) {
-          console.warn("[Upload] STS returned 401 in body, refreshing headers and retrying...");
-          const refreshed = await refreshUploadHeaders();
-          if (refreshed) {
-            Object.assign(headers, refreshed);
-            continue;
-          }
-        }
-      }
-      throw new Error(
-        `STS token invalid: ${JSON.stringify(data).substring(0, 200)}`,
-      );
+    // RateLimited / too many requests -> transient burst; backoff and retry.
+    if (isRateLimitedPayload(payload) && attempt < STS_MAX_RETRIES) {
+      const backoffMs = Math.min(5000, 500 * 2 ** attempt) + Math.floor(Math.random() * 400);
+      console.warn(`[Upload] STS rate limited (attempt ${attempt + 1}/${STS_MAX_RETRIES + 1}), retrying in ${backoffMs}ms...`);
+      await sleep(backoffMs);
+      continue;
     }
 
-    return data.data;
+    throw outcome.error;
   }
 
   throw new Error("STS token request failed after retries");
@@ -137,6 +188,7 @@ async function uploadToOSS(
   fileBuffer: ArrayBuffer,
   stsData: STSResponse["data"],
   filename: string,
+  options: { keepSignature?: boolean } = {},
 ): Promise<string> {
   const {
     access_key_id,
@@ -214,7 +266,10 @@ async function uploadToOSS(
     headers: { "Content-Type": contentType },
   });
 
-  return file_url.split("?")[0];
+  // The STS file_url carries the OSS signature in its query params; without it
+  // the (private) bucket returns 403. Keep the signature when the caller needs
+  // to read the content back; strip it only for public-facing display URLs.
+  return options.keepSignature ? file_url : file_url.split("?")[0];
 }
 
 /**
@@ -652,7 +707,9 @@ export async function processImagesForQwen(
             typeInfo.qwenFileType,
             headers,
           );
-          fileUrl = await uploadToOSS(buffer.buffer, stsData, filename);
+          // Keep the OSS signature: the bucket is private, so an unsigned URL
+          // returns 403 when Qwen (or our own fetch-back) reads the object.
+          fileUrl = await uploadToOSS(buffer.buffer, stsData, filename, { keepSignature: true });
           fileId = stsData.file_id;
         } catch (err: any) {
           console.error("[Upload] Failed to download/re-upload HTTP media:", err.message);
@@ -695,7 +752,9 @@ export async function processImagesForQwen(
             typeInfo.qwenFileType,
             headers,
           );
-          fileUrl = await uploadToOSS(buffer.buffer, stsData, filename);
+          // Keep the OSS signature: the bucket is private, so an unsigned URL
+          // returns 403 when Qwen (or our own fetch-back) reads the object.
+          fileUrl = await uploadToOSS(buffer.buffer, stsData, filename, { keepSignature: true });
           fileId = stsData.file_id;
         } catch (err: any) {
           console.error("[Upload] Failed to upload media:", err.message);
@@ -748,7 +807,10 @@ export async function processImagesForQwen(
   return { text: textParts.join("\n"), files };
 }
 
-const LARGE_PROMPT_THRESHOLD = 131072;
+// Keep in sync with stream-creator's LARGE_PROMPT_THRESHOLD (env LARGE_PROMPT_THRESHOLD,
+// default 512KB). This is only the upload-side guard: prompts at or below the
+// threshold go inline and never reach the file-upload path.
+const LARGE_PROMPT_THRESHOLD = config.largePromptThreshold;
 
 export async function uploadLargePromptAsFile(
   promptText: string,
@@ -761,7 +823,10 @@ export async function uploadLargePromptAsFile(
   const buffer = Buffer.from(promptText, "utf-8");
 
   const stsData = await getSTSToken(filename, buffer.length, "file", headers);
-  const fileUrl = await uploadToOSS(buffer.buffer, stsData, filename);
+  // Keep the FULL signed file_url (query params included). Stripping the
+  // signature makes the private OSS bucket return 403 on GET, breaking both
+  // Qwen's own file access and our content fetch-back for large prompts.
+  const fileUrl = await uploadToOSS(buffer.buffer, stsData, filename, { keepSignature: true });
 
   return {
     type: "file",

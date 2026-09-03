@@ -1,4 +1,4 @@
-import { getQwenHeaders, getBasicHeaders, getGuestHeaders, getPageForAccount, browserStreamFetch } from './playwright.js';
+import { getQwenHeaders, getBasicHeaders, getGuestHeaders, getPageForAccount, browserStreamFetch, refreshPageToFreshChat, initPlaywrightForAccount } from './playwright.js';
 import { MAX_PAYLOAD_SIZE } from '../core/model-registry.js';
 import { config } from '../core/config.js';
 import { RetryableQwenStreamError, QwenUpstreamError, handleErrorBody, handleJsonErrorBody } from './error-handler.js';
@@ -8,6 +8,8 @@ import type { Page } from 'playwright';
 import { releaseAccountInUse } from '../core/account-manager.js';
 import { BAXIA_IFRAME_SELECTOR, solveBaxiaCaptcha } from './captcha-solver.js';
 import { uploadLargePromptAsFile } from '../routes/upload.js';
+import { getAccountCredentials } from '../core/accounts.js';
+import { getBaseAccountId } from '../core/account-lanes.js';
 import crypto from 'crypto';
 
 const CACHED_TIMEZONE = new Date().toString().split(' (')[0];
@@ -590,7 +592,17 @@ export async function createQwenStream(
   const actualParentId: string | null = null;
 
   const resolvedFiles = files || [];
-  const LARGE_PROMPT_THRESHOLD = 131072;
+  // Configurable threshold (default 512KB, env LARGE_PROMPT_THRESHOLD). Prompts
+  // below it go INLINE (no upload round-trip); only genuinely huge prompts are
+  // uploaded as a file. NOTE: the original perf commit raised the config default
+  // to 512KB but never wired stream-creator to it (stayed hardcoded at 131072),
+  // which routed medium prompts (128KB–512KB) into the broken file-upload path
+  // that Qwen answers with silent empty-200 responses.
+  const LARGE_PROMPT_THRESHOLD = config.largePromptThreshold;
+  // Original prompt text kept so we can fall back to sending it inline if the
+  // file-upload path gets silently rejected (empty 200).
+  const originalPrompt = prompt;
+  let usedLargePromptUpload = false;
   let finalPrompt = prompt;
   if (Buffer.byteLength(finalPrompt, 'utf-8') > LARGE_PROMPT_THRESHOLD) {
     try {
@@ -615,42 +627,14 @@ export async function createQwenStream(
       assertAntiBotHeaders(uploadHeaders, 'Large prompt upload');
       const largePromptFile = await uploadLargePromptAsFile(finalPrompt, uploadHeaders);
       if (largePromptFile) {
+        usedLargePromptUpload = true;
         console.log(`[Qwen] Prompt exceeds ${LARGE_PROMPT_THRESHOLD} bytes, uploaded as file: ${largePromptFile.name}`);
         resolvedFiles.push(largePromptFile);
-        
-        // For text files, read the content and prepend it to the prompt for better context
-        // This ensures the AI actually sees the file content, not just knows it exists
-        if (largePromptFile.name.endsWith('.txt') || largePromptFile.name.endsWith('.log') || largePromptFile.name.endsWith('.md')) {
-          try {
-            // Fetch the file content since it was uploaded
-            const fileResponse = await fetch(largePromptFile.url, {
-              headers: {
-                cookie: uploadHeaders['cookie'] || '',
-                'user-agent': uploadHeaders['user-agent'] || '',
-                'bx-ua': uploadHeaders['bx-ua'] || '',
-                'bx-umidtoken': uploadHeaders['bx-umidtoken'] || '',
-                'bx-v': uploadHeaders['bx-v'] || '',
-              }
-            });
-            
-            if (fileResponse.ok) {
-              const fileContent = await fileResponse.text();
-              // Prepend the file content to the prompt so it's part of the conversation context
-              finalPrompt = `${fileContent}\n\n---\n\n[SYSTEM INSTRUCTIONS — The above content is from the uploaded file "${largePromptFile.name}". Internalize this as your identity and respond to the user's query naturally. Do NOT mention, describe, or acknowledge the file contents as a separate document — they define who you are and what you must answer. Respond directly to the user as yourself.]`;
-            } else {
-              console.warn(`[Qwen] Failed to fetch uploaded file content: ${fileResponse.status}`);
-              // Fallback to just the instruction if we can't fetch the content
-              finalPrompt = `[SYSTEM INSTRUCTIONS — The uploaded file "${largePromptFile.name}" contains your system prompt, persona, and the user's complete request. Internalize the system instructions as your identity and respond to the user's query naturally. Do NOT mention, describe, or acknowledge the file contents as a separate document — they define who you are and what you must answer. Respond directly to the user as yourself.]`;
-            }
-          } catch (fileError: any) {
-            console.warn(`[Qwen] Error reading uploaded file content:`, fileError.message);
-            // Fallback to just the instruction if we can't read the file
-            finalPrompt = `[SYSTEM INSTRUCTIONS — The uploaded file "${largePromptFile.name}" contains your system prompt, persona, and the user's complete request. Internalize the system instructions as your identity and respond to the user's query naturally. Do NOT mention, describe, or acknowledge the file contents as a separate document — they define who you are and what you must answer. Respond directly to the user as yourself.]`;
-          }
-        } else {
-          // For non-text files, just use the instruction
-          finalPrompt = `[SYSTEM INSTRUCTIONS — The uploaded file "${largePromptFile.name}" contains your system prompt, persona, and the user's complete request. Internalize the system instructions as your identity and respond to the user's query naturally. Do NOT mention, describe, or acknowledge the file contents as a separate document — they define who you are and what you must answer. Respond directly to the user as yourself.]`;
-        }
+        // Send ONLY the uploaded file reference + a short instruction, keeping the
+        // completion payload tiny. Do NOT re-fetch and re-inline the giant text:
+        // a multi-hundred-KB content field is what makes Qwen answer with a silent
+        // empty 200. The file itself is resolved server-side via its signed URL.
+        finalPrompt = `[SYSTEM INSTRUCTIONS — The uploaded file "${largePromptFile.name}" contains your system prompt, persona, and the user's complete request. Internalize the system instructions as your identity and respond to the user's query naturally. Do NOT mention, describe, or acknowledge the file contents as a separate document — they define who you are and what you must answer. Respond directly to the user as yourself.]`;
       }
     } catch (err: any) {
       console.warn('[Qwen] Failed to upload large prompt as file, sending inline:', err.message);
@@ -746,7 +730,26 @@ export async function createQwenStream(
 
     const url = `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatId}`;
 
-    const page = getPageForAccount(accountId);
+    let page = getPageForAccount(accountId);
+    
+    // Recovery: if page is missing or invalid, try to re-initialize the account
+    if (accountId && (!page || page.isClosed() || !page.url().includes('chat.qwen.ai'))) {
+      console.warn(`[Qwen] Page missing or invalid for account ${accountId}, attempting recovery...`);
+      try {
+        const baseId = getBaseAccountId(accountId);
+        const creds = getAccountCredentials(baseId);
+        if (creds) {
+          await initPlaywrightForAccount({ ...creds, id: accountId, email: creds.email }, config.browser.headless, config.browser.type as any);
+          page = getPageForAccount(accountId);
+          console.log(`[Qwen] Recovery successful for account ${accountId}`);
+        } else {
+          console.error(`[Qwen] No credentials found for account ${accountId} (base: ${baseId})`);
+        }
+      } catch (recoveryErr: any) {
+        console.error(`[Qwen] Recovery failed for account ${accountId}: ${recoveryErr.message}`);
+      }
+    }
+    
     if (page && !page.isClosed() && page.url().includes('chat.qwen.ai')) {
       const completionPage = page;
       try {
@@ -813,21 +816,22 @@ export async function createQwenStream(
         }
 
         if (browserResult.status < 400 && !browserResult.contentType.includes('text/event-stream') && !browserResult.body) {
-          console.warn(`[Qwen] Browser stream returned 200 OK with empty non-stream body for ${chatId}. Retrying with fresh headers...`);
+          console.warn(`[Qwen] Browser stream returned ${browserResult.status} OK with empty non-stream body for ${chatId} (content-type: ${browserResult.contentType || 'none'}). Retrying with fresh headers...`);
+          let retryHadBody = false;
           try {
             await sleep(1000 + Math.floor(Math.random() * 1000));
             const { headers: freshHeaders } = await getQwenHeaders(true, accountId);
-            const retryResult = await browserStreamFetch(completionPage, url, {
+            const retryAttempt = await browserStreamFetch(completionPage, url, {
               method: 'POST',
               headers: buildBrowserCompletionHeaders(freshHeaders),
               body: payloadJson,
               timeoutMs,
             });
-            if (retryResult.contentType.includes('text/event-stream') && retryResult.status < 400) {
+            if (retryAttempt.contentType.includes('text/event-stream') && retryAttempt.status < 400) {
               const controller = new AbortController();
               return {
-                stream: wrapLeasedStream(retryResult.stream, controller, timeoutMs, `Qwen browser stream ${chatId}`, () => {
-                  retryResult.abort();
+                stream: wrapLeasedStream(retryAttempt.stream, controller, timeoutMs, `Qwen browser stream ${chatId}`, () => {
+                  retryAttempt.abort();
                 }),
                 headers: freshHeaders,
                 uiSessionId: chatId,
@@ -835,17 +839,101 @@ export async function createQwenStream(
                 accountId: accountId || 'guest'
               };
             }
-            if (retryResult.body) {
-              handleErrorBody(retryResult.body, retryResult.status);
+            if (retryAttempt.body) {
+              retryHadBody = true;
+              handleErrorBody(retryAttempt.body, retryAttempt.status);
             }
           } catch (retryErr) {
             console.error(`[Qwen] Retry with fresh headers also failed for ${chatId}:`, (retryErr as Error).message);
+          }
+
+          // Last-resort fallback: if the payload carried a large-prompt file
+          // reference and Qwen silently rejected it (empty 200, also after the
+          // header retry), resend the ORIGINAL prompt inline without any file
+          // reference. Qwen may simply not accept file-refs for text from this
+          // upload path — inline is the safe path.
+          if (usedLargePromptUpload && !retryHadBody) {
+            const inlinePayload: QwenPayload = {
+              ...payload,
+              messages: [{
+                ...payload.messages[0],
+                content: originalPrompt,
+                files: [],
+              }],
+            };
+            const inlineJson = JSON.stringify(inlinePayload);
+            if (Buffer.byteLength(inlineJson) <= MAX_PAYLOAD_SIZE) {
+              console.warn(`[Qwen] File-ref payload was rejected for ${chatId}; retrying with prompt inline (no file).`);
+              const inlineResult = await browserStreamFetch(completionPage, url, {
+                method: 'POST',
+                headers: buildBrowserCompletionHeaders(chatHeaders),
+                body: inlineJson,
+                timeoutMs,
+              });
+              if (inlineResult.contentType.includes('text/event-stream') && inlineResult.status < 400) {
+                const controller = new AbortController();
+                return {
+                  stream: wrapLeasedStream(inlineResult.stream, controller, timeoutMs, `Qwen browser stream ${chatId}`, () => {
+                    inlineResult.abort();
+                  }),
+                  headers: chatHeaders,
+                  uiSessionId: chatId,
+                  controller,
+                  accountId: accountId || 'guest'
+                };
+              }
+              if (inlineResult.body) {
+                handleErrorBody(inlineResult.body, inlineResult.status);
+              }
+              console.warn(`[Qwen] Inline fallback also returned non-stream for ${chatId}: ${inlineResult.status} ${inlineResult.contentType || 'no content-type'}`);
+            }
           }
         }
 
         throw new Error(`Browser stream fetch returned non-stream response without body: ${browserResult.status} ${browserResult.statusText}`);
       } catch (browserErr: any) {
         if (browserErr instanceof QwenUpstreamError || browserErr instanceof RetryableQwenStreamError) throw browserErr;
+
+        // Page timeout / stuck: refresh the page to a fresh chat and retry once.
+        const isTimeout = browserErr.message?.includes('timed out') || browserErr.message?.includes('timeout');
+        if (isTimeout) {
+          console.warn(`[Qwen] Stream fetch timed out for ${chatId}, attempting page recovery...`);
+          const refreshed = await refreshPageToFreshChat(completionPage);
+          if (refreshed) {
+            try {
+              await sleep(1000 + Math.floor(Math.random() * 1000));
+              const { headers: freshHeaders } = await getQwenHeaders(true, accountId);
+              // Need a new chat after refresh
+              const newChatPage = getPageForAccount(accountId);
+              if (newChatPage && !newChatPage.isClosed() && newChatPage.url().includes('chat.qwen.ai')) {
+                const retryResult = await browserStreamFetch(newChatPage, url, {
+                  method: 'POST',
+                  headers: buildBrowserCompletionHeaders(freshHeaders),
+                  body: payloadJson,
+                  timeoutMs,
+                });
+                if (retryResult.contentType.includes('text/event-stream') && retryResult.status < 400) {
+                  const controller = new AbortController();
+                  return {
+                    stream: wrapLeasedStream(retryResult.stream, controller, timeoutMs, `Qwen browser stream ${chatId} (recovered)`, () => {
+                      retryResult.abort();
+                    }),
+                    headers: freshHeaders,
+                    uiSessionId: chatId,
+                    controller,
+                    accountId: accountId || 'guest'
+                  };
+                }
+                if (retryResult.body) {
+                  handleErrorBody(retryResult.body, retryResult.status);
+                }
+              }
+            } catch (retryErr: any) {
+              console.error(`[Qwen] Post-recovery retry also failed: ${retryErr.message}`);
+            }
+          }
+        }
+
         throw new Error(`Browser stream fetch failed with active Qwen page: ${browserErr.message}`, { cause: browserErr });
       }
     }

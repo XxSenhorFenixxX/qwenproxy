@@ -1,11 +1,14 @@
 import type { Page } from 'playwright';
-import { accountPages, getPageForAccount, sleep } from './browser-manager.js';
+import { accountPages, getPageForAccount, sleep, saveStorageState, accountContexts } from './browser-manager.js';
 import { humanMouseMove, humanScroll, humanDelay } from './human-behavior.js';
 import { config } from '../core/config.js';
 import { isMouseLocked } from './mouse-lock.js';
+import { getBaseAccountId } from '../core/account-lanes.js';
 
 const KEEP_ALIVE_INTERVAL_MS = 3 * 60 * 1000;
 const NAVIGATION_INTERVAL_MS = 8 * 60 * 1000;
+const COOKIE_SAVE_INTERVAL_MS = 15 * 60 * 1000; // Save fresh cookies every 15min
+const lastCookieSave = new Map<string, number>();
 
 let running = false;
 let intervalId: ReturnType<typeof setInterval> | null = null;
@@ -15,6 +18,14 @@ async function performKeepAlive(accountId: string, page: Page): Promise<void> {
   if (page.isClosed()) return;
 
   try {
+    // Check if session has expired (login button visible)
+    const { isPageLoggedIn } = await import('./browser-manager.js');
+    const loggedIn = await isPageLoggedIn(page);
+    if (!loggedIn) {
+      console.warn(`[SessionKeeper] Session expired for ${accountId}. Re-import via login.ts [E] or re-login manually.`);
+      return;
+    }
+
     const viewport = page.viewportSize();
     if (!viewport) return;
 
@@ -51,6 +62,17 @@ async function performKeepAlive(accountId: string, page: Page): Promise<void> {
         });
       }
       lastNavigation.set(accountId, now);
+    }
+
+    // Periodically save fresh cookies to prevent session expiry on restart
+    const lastSave = lastCookieSave.get(accountId) || 0;
+    if (now - lastSave > COOKIE_SAVE_INTERVAL_MS) {
+      const ctx = accountContexts.get(accountId);
+      if (ctx) {
+        const baseId = getBaseAccountId(accountId);
+        await saveStorageState(ctx, baseId);
+        lastCookieSave.set(accountId, now);
+      }
     }
   } catch (err: any) {
     if (!err.message?.includes('Target closed') && !err.message?.includes('Page is closed')) {

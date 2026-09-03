@@ -77,10 +77,58 @@ app.get('/health', async (c) => {
   })
 })
 
+// Exposes which accounts have hit their daily limit (rate-limited / on cooldown)
+// so you can verify the rotation is skipping the right ones.
+app.get('/accounts/status', async (c) => {
+  const { loadAccounts } = await import('../core/accounts.js')
+  const { getAccountCooldownInfo, getInUseAccounts, syncCooldownsFromDb } = await import('../core/account-manager.js')
+  // Cooldowns are loaded lazily from the DB on first rotation; sync explicitly
+  // so this endpoint is accurate right after a restart.
+  syncCooldownsFromDb()
+  const accounts = loadAccounts()
+  const now = Date.now()
+  const inUse = new Set(getInUseAccounts())
+  return c.json({
+    total: accounts.length,
+    accounts: accounts.map((a) => {
+      const info = getAccountCooldownInfo(a.id)
+      const remainingMs = info?.remainingMs ?? null
+      return {
+        id: a.id,
+        email: a.email,
+        status: info ? 'rate-limited' : (inUse.has(a.id) ? 'in-use' : 'available'),
+        reason: info?.reason ?? null,
+        cooldownUntil: remainingMs ? now + remainingMs : null,
+        remainingMs,
+      }
+    }),
+  })
+})
+
 app.get('/metrics', (c) => {
   return c.text(metrics.formatPrometheus(), {
     headers: { 'Content-Type': 'text/plain; version=0.0.4' },
   })
+})
+
+// Update account password for auto re-login when sessions expire
+app.post('/accounts/:id/password', async (c) => {
+  const { updateAccountPassword } = await import('../core/accounts.js')
+  const id = c.req.param('id')
+  const body: any = await c.req.json().catch(() => ({}))
+  const password = body?.password
+  if (!password || typeof password !== 'string' || password.length === 0) {
+    return c.json({ error: 'Password is required' }, 400)
+  }
+  try {
+    const success = updateAccountPassword(id, password)
+    if (!success) {
+      return c.json({ error: 'Account not found' }, 404)
+    }
+    return c.json({ success: true, message: 'Password updated. Server will use it for auto re-login.' })
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500)
+  }
 })
 
 app.onError((err, c) => {
@@ -137,7 +185,7 @@ export async function startServer(): Promise<void> {
       const stagger = i === 0 ? 0 : randomDelay(config.accounts.initStaggerMinMs, config.accounts.initStaggerMaxMs)
       if (stagger > 0) await sleep(stagger)
       try {
-        await initPlaywrightForAccount({ ...creds, id: account.id, email: account.email }, config.browser.headless)
+        await initPlaywrightForAccount({ ...creds, id: account.id, email: account.email }, config.browser.headless, config.browser.type)
       } catch (err: any) {
         console.error(`[Server] Failed to initialize account ${account.email}:`, err.message)
       }
@@ -161,7 +209,7 @@ export async function startServer(): Promise<void> {
       warmAllPools(activeAccounts.map(a => a.id)).catch(() => {})
     }
   } else {
-    await initPlaywright(config.browser.headless)
+    await initPlaywright(config.browser.headless, config.browser.type)
   }
 
   const { startSessionKeeper } = await import('../services/session-keeper.js')

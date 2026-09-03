@@ -198,6 +198,161 @@ function quoteUnquotedKeys(input: string): string {
   return out;
 }
 
+/**
+ * Escape control characters (real newlines/tabs/CR) that appear INSIDE JSON
+ * string values, and escape unescaped inner double quotes inside strings.
+ */
+function escapeControlCharsInStrings(input: string): string {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < input.length; i++) {
+    const char = input[i];
+    if (escaped) {
+      out += '\\' + char;
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') { escaped = true; continue; }
+    if (char === '"') {
+      if (inString) {
+        let j = i + 1;
+        while (j < input.length && /\s/.test(input[j])) j++;
+        const next = input[j] || '';
+        if (next === ',' || next === '}' || next === ']' || next === ':' || next === '') {
+          inString = false;
+          out += char;
+        } else {
+          out += '\\"';
+        }
+      } else {
+        inString = true;
+        out += char;
+      }
+      continue;
+    }
+    if (inString) {
+      if (char === '\n') out += '\\n';
+      else if (char === '\r') out += '\\r';
+      else if (char === '\t') out += '\\t';
+      else if (char.charCodeAt(0) < 32) out += '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0');
+      else out += char;
+    } else {
+      out += char;
+    }
+  }
+  return out;
+}
+
+/**
+ * Detect and repair unbracketed sequences of JSON objects assigned to a key:
+ * e.g. "todos": { "content": "1" }, { "content": "2" }
+ * transforms into "todos": [ { "content": "1" }, { "content": "2" } ]
+ */
+export function fixUnbracketedObjectSequences(input: string): string {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  let i = 0;
+
+  while (i < input.length) {
+    const ch = input[i];
+
+    if (escaped) {
+      out += ch;
+      escaped = false;
+      i++;
+      continue;
+    }
+    if (ch === '\\') {
+      out += ch;
+      escaped = true;
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      out += ch;
+      inString = !inString;
+      i++;
+      continue;
+    }
+    if (inString) {
+      out += ch;
+      i++;
+      continue;
+    }
+
+    if (ch === ':') {
+      out += ch;
+      i++;
+      let ws = '';
+      while (i < input.length && /\s/.test(input[i])) { ws += input[i]; i++; }
+      out += ws;
+      if (i < input.length && input[i] === '{') {
+        let startObjIndex = i;
+        let objCount = 0;
+        let j = i;
+        let objectsEnd = -1;
+
+        while (j < input.length) {
+          if (input[j] === '{') {
+            let depth = 0;
+            let strIn = false;
+            let escIn = false;
+            let k = j;
+            while (k < input.length) {
+              const c = input[k];
+              if (escIn) { escIn = false; k++; continue; }
+              if (c === '\\') { escIn = true; k++; continue; }
+              if (c === '"') { strIn = !strIn; k++; continue; }
+              if (!strIn) {
+                if (c === '{') depth++;
+                else if (c === '}') {
+                  depth--;
+                  if (depth === 0) {
+                    k++;
+                    break;
+                  }
+                }
+              }
+              k++;
+            }
+            objCount++;
+            objectsEnd = k;
+            j = k;
+            let look = j;
+            while (look < input.length && /\s/.test(input[look])) look++;
+            if (look < input.length && input[look] === ',') {
+              let afterComma = look + 1;
+              while (afterComma < input.length && /\s/.test(input[afterComma])) afterComma++;
+              if (afterComma < input.length && input[afterComma] === '{') {
+                j = afterComma;
+                continue;
+              }
+            }
+            break;
+          } else {
+            break;
+          }
+        }
+
+        if (objCount > 1 && objectsEnd > startObjIndex) {
+          const objsChunk = input.substring(startObjIndex, objectsEnd);
+          out += '[' + objsChunk + ']';
+          i = objectsEnd;
+          continue;
+        }
+      }
+      continue;
+    }
+
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
 export function robustParseJSON(str: string): any {
   let sanitized = str.trim();
   sanitized = sanitized.replace(/^```json\s*/, '').replace(/```$/, '').trim();
@@ -208,7 +363,13 @@ export function robustParseJSON(str: string): any {
   const jsonPart = sanitized.substring(firstBrace);
   try { return JSON.parse(jsonPart); } catch { /* continue */ }
 
-  let currentJson = quoteUnquotedKeys(jsonPart);
+  const withArraysFixed = fixUnbracketedObjectSequences(jsonPart);
+  try { return JSON.parse(withArraysFixed); } catch { /* continue */ }
+
+  try { return JSON.parse(escapeControlCharsInStrings(withArraysFixed)); } catch { /* continue */ }
+  try { return JSON.parse(escapeControlCharsInStrings(jsonPart)); } catch { /* continue */ }
+
+  let currentJson = quoteUnquotedKeys(withArraysFixed);
   currentJson = fixMissingOpeningQuotes(currentJson);
   currentJson = quoteUnquotedStringValues(currentJson);
   currentJson = currentJson.replace(/([{,]\s*)"([a-zA-Z0-9_]+)"\s*:\s*"\2"\s*:/g, '$1"$2":');
@@ -249,8 +410,8 @@ export function robustParseJSON(str: string): any {
     let aggressive = fixedJson.trim();
     aggressive = aggressive.replace(/,\s*([}\]])/g, '$1');
     const { result: aggFixed, openBraces: ob, openBrackets: bk, inString: aggInString } = sanitizeAndBalance(aggressive);
-  try { return JSON.parse(closeBraces(aggFixed, ob, bk, aggInString)); } catch {
-    return null;
+    try { return JSON.parse(closeBraces(aggFixed, ob, bk, aggInString)); } catch {
+      return null;
+    }
   }
-}
 }

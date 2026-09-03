@@ -2,6 +2,7 @@ import type { QwenAccount} from './accounts.js';
 import { loadAccounts, updateAccountCooldown, invalidateAccountsCache as invalidateAccountsCacheSource } from './accounts.js'
 import { config } from './config.js'
 import { getBaseAccountId, makeAccountLaneId } from './account-lanes.js'
+import { getRateLimitHintHours } from '../services/error-handler.js'
 
 let currentIndex = 0
 const inUseAccounts = new Set<string>()
@@ -83,6 +84,27 @@ export function markAccountRateLimited(accountId: string, cooldownMs?: number, r
   }
 
   console.log(`[AccountManager] Account ${accountId} marked as rate-limited. Cooldown until ${new Date(until).toISOString()}`)
+}
+
+/**
+ * Marks an account as rate-limited using a Qwen error message, honoring the
+ * "Wait about N hour(s)" hint when present and falling back to the configured
+ * RATE_LIMIT_COOLDOWN_HOURS otherwise. Use this from every code path that
+ * observes a rate-limit error (stream creation, mid-stream, warm pool) so the
+ * account is reliably skipped by the rotation on subsequent requests.
+ */
+export function markAccountRateLimitedByMessage(accountId: string, message: string, reason = 'RateLimited'): void {
+  const hours = getRateLimitHintHours(message) ?? config.accounts.rateLimitCooldownHours;
+  markAccountRateLimited(accountId, hours * 60 * 60 * 1000, reason);
+}
+
+/**
+ * Forces the in-memory cooldown map to sync with the DB (cooldown_until
+ * persisted across restarts). Called lazily by rotation; expose it so status
+ * endpoints can show accurate per-account state right after a restart.
+ */
+export function syncCooldownsFromDb(): void {
+  getAccountsWithCooldownSync()
 }
 
 export function clearAccountCooldown(accountId: string): void {

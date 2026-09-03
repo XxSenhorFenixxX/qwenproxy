@@ -1,5 +1,6 @@
 import { getBasicHeaders, getPageForAccount } from './playwright.js';
-import { markAccountRateLimited } from '../core/account-manager.js';
+import { markAccountRateLimitedByMessage } from '../core/account-manager.js';
+import { isRateLimitError } from './error-handler.js';
 import { config } from '../core/config.js';
 import { QwenUpstreamError } from './error-handler.js';
 import type { Page } from 'playwright';
@@ -22,6 +23,38 @@ const warmPool: Map<string, WarmPoolEntry[]> = new Map();
 const inFlightWarmChats = new Set<string>();
 
 const refillPromises: Map<string, Promise<void>> = new Map();
+
+// Resolvers waiting for the FIRST chat of a pool to become available. The
+// refill pushes chats one at a time; a request that finds the pool empty should
+// resume as soon as ONE chat exists instead of awaiting the whole refill
+// (which creates N chats sequentially with 300-1000ms sleeps between them).
+const firstChatWaiters = new Map<string, Set<() => void>>();
+
+function notifyChatAvailable(accountId: string): void {
+  const waiters = firstChatWaiters.get(accountId);
+  if (!waiters) return;
+  firstChatWaiters.delete(accountId);
+  for (const resolve of waiters) resolve();
+}
+
+function waitForFirstChat(accountId: string, timeoutMs: number): Promise<void> {
+  const pool = warmPool.get(accountId);
+  if (pool && pool.length > 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const waiters = firstChatWaiters.get(accountId);
+      if (waiters) {
+        waiters.delete(resolve);
+        if (waiters.size === 0) firstChatWaiters.delete(accountId);
+      }
+      resolve();
+    }, timeoutMs);
+    timer.unref?.();
+    let waiters = firstChatWaiters.get(accountId);
+    if (!waiters) { waiters = new Set(); firstChatWaiters.set(accountId, waiters); }
+    waiters.add(resolve);
+  });
+}
 
 const WARM_POOL_SIZE = config.warmPool.size;
 const WARM_POOL_TTL_MS = config.warmPool.ttlMs;
@@ -94,7 +127,7 @@ async function createRealQwenChat(header: Record<string, string>, accountId?: st
   const page = getPageForAccount(accountId);
   const body = JSON.stringify({
     title: 'Nova Conversa',
-    models: ['qwen3.7-plus'],
+    models: ['qwen3.8-max'],
     chat_mode: 'normal',
     chat_type: 't2t',
     timestamp: Date.now(),
@@ -222,6 +255,7 @@ async function refillPoolForAccount(accountId: string) {
       pool.push({ chatId, headers, accountId, timestamp: Date.now() });
       existingIds.add(chatId);
       reused++;
+      notifyChatAvailable(accountId);
     }
     if (reused > 0) {
       console.log(`[WarmPool] Reused ${reused} existing unused chats for ${accountId}`);
@@ -238,15 +272,12 @@ async function refillPoolForAccount(accountId: string) {
     try {
       const chatId = await createRealQwenChat(headers, acctId);
       pool.push({ chatId, headers, accountId, timestamp: Date.now() });
+      notifyChatAvailable(accountId);
     } catch (err: any) {
-      if (err instanceof QwenUpstreamError) {
-        if (err.upstreamCode === 'RateLimited' || err.upstreamStatus === 429) {
-          const hourHint = err.message?.match(/Wait about (\d+) hour/);
-          const cooldownMs = hourHint ? parseInt(hourHint[1]) * 60 * 60 * 1000 : undefined;
-          markAccountRateLimited(accountId, cooldownMs, 'RateLimited');
-          console.warn(`[WarmPool] Account ${accountId} rate-limited during chat creation. Marked for cooldown.`);
-          break;
-        }
+      if (isRateLimitError(err)) {
+        markAccountRateLimitedByMessage(accountId, err.message, 'RateLimited');
+        console.warn(`[WarmPool] Account ${accountId} rate-limited during chat creation. Marked for cooldown.`);
+        break;
       }
       console.error(`[WarmPool] chat creation failed for ${accountId}:`, (err as Error).message);
     }
@@ -273,19 +304,26 @@ export async function getWarmedChat(accountId?: string) {
   }
 
   if (pool.length === 0) {
-    if (!refillPromises.has(key)) {
-      refillPromises.set(key, refillPoolForAccount(key).finally(() => refillPromises.delete(key)));
+    // Resume as soon as the FIRST chat is ready — not after the whole pool
+    // refills (which creates N chats sequentially with sleeps between them).
+    // Race the first-chat notification against the refill promise settling so
+    // a FAILED refill (e.g. header fetch error) fails fast instead of making
+    // waiters sit for the full timeout. Give it two attempts: the refill may
+    // transiently fail on the first try (old code also retried once).
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let refillPromise = refillPromises.get(key);
+      if (!refillPromise) {
+        refillPromise = refillPoolForAccount(key).finally(() => refillPromises.delete(key));
+        refillPromises.set(key, refillPromise);
+      }
+      await Promise.race([
+        waitForFirstChat(key, 20000),
+        refillPromise.then(() => undefined, () => undefined),
+      ]);
+      if (pool.length > 0) break;
     }
-    await refillPromises.get(key);
   }
-  if (pool.length === 0) {
-    await new Promise(r => setTimeout(r, 200));
-    if (!refillPromises.has(key)) {
-      refillPromises.set(key, refillPoolForAccount(key).finally(() => refillPromises.delete(key)));
-    }
-    await refillPromises.get(key);
-  }
-  if (pool.length === 0) throw new Error(`Warm pool empty after retry for ${key}`);
+  if (pool.length === 0) throw new Error(`Warm pool empty after refill for ${key}`);
   const entry = pool.shift()!;
   markWarmChatInFlight(key, entry.chatId);
   return entry;

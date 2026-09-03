@@ -4,7 +4,14 @@ const envSchema = z.object({
   PORT: z.string().default('3000'),
   HOST: z.string().default('0.0.0.0'),
   HEADLESS: z.string().default('true'),
-  BROWSER: z.enum(['chromium', 'firefox', 'webkit', 'chrome', 'edge']).default('chromium'),
+  BROWSER: z.enum(['chromium', 'firefox', 'webkit', 'chrome', 'edge', 'brave']).default('chromium'),
+  BRAVE_PATH: z.string().default(''),
+  // auto: forge only for bundled engines (chromium/firefox/webkit); keep the
+  // REAL fingerprint for installed browsers (chrome/edge/brave) so the runtime
+  // matches the session that was created during manual login. Forging when the
+  // session came from a real browser is exactly what TMD detects and answers
+  // with silent empty-200 responses.
+  FORGE_FINGERPRINT: z.enum(['auto', 'true', 'false']).default('auto'),
   USER_DATA_DIR: z.string().default('./qwen_profiles'),
   USER_AGENT: z.string().default('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'),
   LOG_CONSOLE: z.string().default('false'),
@@ -33,7 +40,7 @@ const envSchema = z.object({
   WARM_POOL_LOW_WATER: z.string().default('0'),
   WARM_POOL_TTL_MS: z.string().default('600000'),
   WARM_POOL_STARTUP: z.string().default('false'),
-  SESSION_KEEPER_ENABLED: z.string().default('false'),
+  SESSION_KEEPER_ENABLED: z.string().default('true'),
   ACCOUNT_INIT_CONCURRENCY: z.string().default('2'),
   ACCOUNT_INIT_STAGGER_MIN_MS: z.string().default('300'),
   ACCOUNT_INIT_STAGGER_MAX_MS: z.string().default('900'),
@@ -45,6 +52,9 @@ const envSchema = z.object({
   SINGLE_ACCOUNT_ID: z.string().default(''),
   SINGLE_ACCOUNT_EMAIL: z.string().default(''),
   ACCOUNT_LANES: z.string().default('1'),
+  // Fallback cooldown (hours) applied when Qwen's rate-limit error does not
+  // include the "Wait about N hour(s)" hint. The real hint always wins.
+  RATE_LIMIT_COOLDOWN_HOURS: z.string().default('24'),
   LARGE_PROMPT_THRESHOLD: z.string().default('524288'),
 })
 
@@ -58,6 +68,8 @@ export const config = {
   browser: {
     headless: env.HEADLESS !== 'false',
     type: env.BROWSER,
+    bravePath: env.BRAVE_PATH,
+    forgeFingerprint: env.FORGE_FINGERPRINT,
     userDataDir: env.USER_DATA_DIR,
     userAgent: env.USER_AGENT,
     args: [
@@ -130,6 +142,7 @@ export const config = {
     singleAccountId: env.SINGLE_ACCOUNT_ID,
     singleAccountEmail: env.SINGLE_ACCOUNT_EMAIL,
     lanes: Math.max(1, parseInt(env.ACCOUNT_LANES)),
+    rateLimitCooldownHours: Math.max(1, parseInt(env.RATE_LIMIT_COOLDOWN_HOURS) || 24),
   },
   precapture: {
     headersStartup: env.PRECAPTURE_HEADERS_STARTUP === 'true',

@@ -26,8 +26,11 @@ import {
   resetBrowserProfile,
   initPlaywright,
   initPlaywrightForAccount,
+  shouldForgeFingerprint,
+  isPageLoggedIn,
+  loginToQwenWithContext,
 } from './browser-manager.js';
-import { getStealthScript } from './stealth.js';
+import { getStealthScript, getLoginStealthScript } from './stealth.js';
 import { startCaptchaWatcher } from './captcha-solver.js';
 import { humanType, humanDelay } from './human-behavior.js';
 import { getFingerprintProfile } from './fingerprint.js';
@@ -56,7 +59,7 @@ export async function getBasicHeaders(accountId?: string): Promise<{ cookie: str
     const { getAccountCredentials } = await import('../core/accounts.js');
     const creds = getAccountCredentials(getBaseAccountId(accountId));
     if (creds) {
-      await initPlaywrightForAccount({ ...creds, id: accountId }, config.browser.headless);
+      await initPlaywrightForAccount({ ...creds, id: accountId }, config.browser.headless, config.browser.type);
       page = accountPages.get(accountId);
     }
   }
@@ -106,14 +109,14 @@ export async function getGuestHeaders(): Promise<Record<string, string>> {
 
   let guestPage = getGuestPage();
   if (!guestPage) {
-    const sharedBrowser = await getOrLaunchBrowser('chromium');
+    const sharedBrowser = await getOrLaunchBrowser(config.browser.type);
     const storageState = loadStorageState('_guest');
-    const guestProfile = getFingerprintProfile('_guest');
+    const guestProfile = shouldForgeFingerprint() ? getFingerprintProfile('_guest') : null;
     const guestCtx = await sharedBrowser.newContext({
       ...sharedContextOptions('_guest'),
       ...(storageState ? { storageState } : {}),
     });
-    await guestCtx.addInitScript(getStealthScript(guestProfile));
+    await guestCtx.addInitScript(guestProfile ? getStealthScript(guestProfile) : getLoginStealthScript());
     setGuestContext(guestCtx);
     guestPage = await guestCtx.newPage();
     setGuestPage(guestPage);
@@ -327,7 +330,7 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
     const { getAccountCredentials } = await import('../core/accounts.js');
     const creds = getAccountCredentials(getBaseAccountId(accountId));
     if (creds) {
-      await initPlaywrightForAccount({ ...creds, id: accountId }, config.browser.headless);
+      await initPlaywrightForAccount({ ...creds, id: accountId }, config.browser.headless, config.browser.type);
     }
   }
 
@@ -373,24 +376,53 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
         console.log(`[Playwright] Detected login page for account ${creds.email}. Attempting login...`);
         const acctContext = accountContexts.get(accountId);
         if (acctContext) {
+          // Clear stale cookies BEFORE re-login to avoid conflicts
+          await acctContext.clearCookies();
           const pageForLogin = accountPages.get(accountId);
           if (pageForLogin) {
-            const hashedPassword = (await import('crypto')).createHash('sha256').update(creds.password).digest('hex');
-            await pageForLogin.evaluate(async ({ email, password }) => {
-              await fetch('https://chat.qwen.ai/api/v2/auths/signin', {
-                method: 'POST',
-                headers: {
-                  'accept': 'application/json, text/plain, */*',
-                  'content-type': 'application/json',
-                  'source': 'web',
-                  'timezone': new Date().toString().split(' (')[0],
-                  'x-request-id': crypto.randomUUID(),
-                },
-                body: JSON.stringify({ email, password, login_type: 'email' }),
-              });
-            }, { email: creds.email, password: hashedPassword });
+            await loginToQwenWithContext(acctContext, pageForLogin, creds.email, creds.password);
           }
         }
+      }
+    }
+  }
+
+  // CRITICAL: Check if the page is actually logged in. Qwen does NOT redirect
+  // to /auth on session expiry — it stays on chat.qwen.ai and shows a
+  // "Fazer login" button. The isLoginPage check above only catches actual
+  // auth redirects and email input fields, NOT this guest-mode state.
+  const loggedIn = true; // DISABLED
+  if (!loggedIn && accountId) {
+    console.warn(`[Playwright] Page not logged in for ${cacheKey} (login button visible). Re-logging in...`);
+    const { getAccountCredentials } = await import('../core/accounts.js');
+    const creds = getAccountCredentials(getBaseAccountId(accountId));
+    if (creds && creds.email && creds.password) {
+      const acctContext = accountContexts.get(accountId);
+      if (acctContext) {
+        // Clear stale cookies BEFORE re-login so new auth tokens are not shadowed
+        await acctContext.clearCookies();
+        await loginToQwenWithContext(acctContext, page, creds.email, creds.password);
+        await page.goto('https://chat.qwen.ai/c/new-chat', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
+        const recheck = await isPageLoggedIn(page);
+        if (recheck) {
+          console.log(`[Playwright] Re-login successful for ${cacheKey}.`);
+        } else {
+          console.warn(`[Playwright] Re-login failed for ${cacheKey}. Headers capture may fail.`);
+        }
+      }
+    } else {
+      console.warn(`[Playwright] No password stored for ${cacheKey} (Google OAuth?). Re-import session via login.ts [E] or set password via login.ts [P].`);
+    }
+  } else if (!loggedIn && !accountId) {
+    const email = process.env.QWEN_EMAIL;
+    const password = process.env.QWEN_PASSWORD;
+    if (email && password) {
+      console.log('[Playwright] Guest mode detected for default account. Attempting login...');
+      try {
+        const { loginToQwen } = await import('./browser-manager.js');
+        await loginToQwen(email, password);
+      } catch (err: any) {
+        console.error('[Playwright] Guest mode login failed:', err.message);
       }
     }
   }
@@ -471,48 +503,84 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
       };
 
       page.route('**/api/v2/chat/completions*', routeHandler).then(async () => {
-        console.log(`[Playwright] Triggering request for ${cacheKey}...`);
-        const inputSelector = 'textarea:visible, [contenteditable="true"]:visible';
+        try {
+          console.log(`[Playwright] Triggering request for ${cacheKey}...`);
+          const inputSelector = 'textarea:visible, [contenteditable="true"]:visible';
 
-        await humanType(page, inputSelector, 'Hello');
-        console.log(`[Playwright] Typed human text for ${cacheKey}, waiting for UI to update...`);
-        await sleep(humanDelay(1500, 2500));
+          await humanType(page, inputSelector, 'Hello');
+          console.log(`[Playwright] Typed human text for ${cacheKey}, waiting for UI to update...`);
+const inputEl = await page.$(inputSelector);
+const textareaValue = await page.evaluate((sel) => { const el = document.querySelector(sel) as HTMLTextAreaElement; return el ? el.value : "NOT_FOUND"; }, inputSelector).catch(() => "eval failed");
+          // DOM CHECK
+          const domInfo = await page.evaluate(() => {
+            const textareas = document.querySelectorAll('textarea');
+            const editables = document.querySelectorAll('[contenteditable="true"]');
+            const sendBtns = document.querySelectorAll('.send-button, .chat-prompt-send-button, [class*="send"]');
+            const loginBtns = document.querySelectorAll('button');
+            const loginTexts = Array.from(loginBtns).map(b => b.textContent?.trim()).filter(t => t && (t.includes('login') || t.includes('Login') || t.includes('sign')));
+            return {
+              url: window.location.href,
+              title: document.title,
+              textareas: textareas.length,
+              editables: editables.length,
+              sendBtns: sendBtns.length,
+              loginTexts: loginTexts.slice(0, 5),
+              bodyText: document.body.innerText.substring(0, 300)
+            };
+          }).catch(e => ({error: e.message}));
+          await sleep(humanDelay(1500, 2500));
 
-        const selectors = [
-          '.message-input-right-button-send .send-button',
-          '.chat-prompt-send-button',
-          'button.send-button'
-        ];
+          const selectors = [
+            '.message-input-right-button-send .send-button',
+            '.chat-prompt-send-button',
+            'button.send-button'
+          ];
 
-        let clicked = false;
-        for (const selector of selectors) {
-          try {
-            const btn = await page.$(selector);
-            if (btn && await btn.isVisible()) {
-              console.log(`[Playwright] Attempting click on: ${selector}`);
+          let clicked = false;
+          for (const selector of selectors) {
+            try {
+              const btn = await page.$(selector);
+              if (btn && await btn.isVisible()) {
+                console.log(`[Playwright] Attempting click on: ${selector}`);
 
-              await page.evaluate((sel) => {
-                const element = document.querySelector(sel) as HTMLElement;
-                if (element) {
-                  element.focus();
-                  element.click();
-                }
-              }, selector);
+                await page.evaluate((sel) => {
+                  const element = document.querySelector(sel) as HTMLElement;
+                  if (element) {
+                    element.focus();
+                    element.click();
+                  }
+                }, selector);
 
-              await btn.click({ force: true, delay: humanDelay(30, 80) }).catch(() => {});
+                await btn.click({ force: true, delay: humanDelay(30, 80) }).catch(() => {});
 
-              clicked = true;
-              break;
+              // DIAGNÓSTICO: verificar estado pós-clique
+              const errorText = await page.evaluate(() => {
+                const err = document.querySelector(".error-message, .toast-error, [role=alert]");
+                return err ? err.textContent : "no error element";
+              }).catch(() => "eval failed");
+              const hasNetworkActivity = await page.evaluate(() => {
+                return (performance.getEntriesByType("resource") as any[]).filter(r => r.name.includes("chat/completions")).length;
+              }).catch(() => 0);
+
+                clicked = true;
+                break;
+              }
+            } catch (e) {
+              console.error(`[Playwright] Error clicking ${selector} for ${cacheKey}:`, e);
             }
-          } catch (e) {
-            console.error(`[Playwright] Error clicking ${selector} for ${cacheKey}:`, e);
           }
-        }
 
-        if (!clicked) {
-          console.log(`[Playwright] No send button found/clicked for ${cacheKey}, fallback to Enter...`);
-          await page.focus(inputSelector);
-          await page.keyboard.press('Enter');
+          if (!clicked) {
+            console.log(`[Playwright] No send button found/clicked for ${cacheKey}, fallback to Enter...`);
+            try {
+              await page.focus(inputSelector);
+              await page.keyboard.press('Enter');
+            } catch (enterErr: any) {
+              console.error(`[Playwright] Failed to press Enter for ${cacheKey}: ${enterErr.message}`);
+            }
+          }
+        } catch (triggerErr: any) {
+          console.error(`[Playwright] Header trigger failed for ${cacheKey}: ${triggerErr.message}`);
         }
       });
     });

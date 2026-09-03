@@ -272,3 +272,81 @@ test('StreamingToolParser: does not leak environment_details when streamed char-
   assert.strictEqual(toolCalls, 1);
   assert.ok(!text.includes('environment_details'), `text should not leak environment_details, got: ${JSON.stringify(text)}`);
 });
+
+test('StreamingToolParser: handles <tool_call_needed> tag variants with unbracketed array (user scenario)', () => {
+  const parser = new StreamingToolParser();
+  const input = `<tool_call_needed>
+{"name": "todowrite", "arguments": {"todos": {"content": "Explorar: identificar o jogo 'Decadent Winter' (Roblox/Robson) e suas mecânicas (3v1, regen de vida)", "status": "in_progress", "priority": "high"}, {"content": "Raciocinar: 2+ abordagens de build abusando das mecânicas, com riscos", "status": "pending", "priority": "high"}, {"content": "Entregar plano numerado e travar aguardando aprovação", "status": "pending", "priority": "high"}}}
+</tool_call_needed>
+<tool_call_needed>
+{"name": "task", "arguments": {"description": "Pesquisar Decadent Winter (Roblox)", "prompt": "PESQUISA...", "subagent_type": "researcher"}}
+</tool_call_needed>`;
+
+  const res = parser.feed(input);
+  const flushed = parser.flush();
+  const totalToolCalls = [...res.toolCalls, ...flushed.toolCalls];
+
+  assert.strictEqual(totalToolCalls.length, 2, 'Should extract both tool calls');
+  assert.strictEqual(totalToolCalls[0].name, 'todowrite');
+  assert.strictEqual(totalToolCalls[1].name, 'task');
+  assert.ok(Array.isArray((totalToolCalls[0].arguments as any).todos), 'todos should be an array');
+  assert.strictEqual((totalToolCalls[0].arguments as any).todos.length, 3);
+  assert.strictEqual((totalToolCalls[1].arguments as any).description, 'Pesquisar Decadent Winter (Roblox)');
+});
+
+test('StreamingToolParser: handles <tools> and <function_call> tag variants', () => {
+  const parser = new StreamingToolParser();
+  const input = `<tools>
+{"name": "bash", "arguments": {"command": "echo 123"}}
+</tools>
+<function_call>
+{"name": "read_file", "arguments": {"path": "/tmp/a.txt"}}
+</function_call>`;
+
+  const res = parser.feed(input);
+  const flushed = parser.flush();
+  const total = [...res.toolCalls, ...flushed.toolCalls];
+
+  assert.strictEqual(total.length, 2);
+  assert.strictEqual(total[0].name, 'bash');
+  assert.strictEqual(total[1].name, 'read_file');
+});
+
+test('StreamingToolParser: handles <tool_call bash> with <tool_arguments> (latest user scenario)', () => {
+  const parser = new StreamingToolParser();
+  const input = `<tool_call bash>
+<tool_arguments>
+{"command": "~/rag-memory/.venv/bin/python ~/rag-memory/scripts/query.py \\"Decaying Winter assist retribution 3 jogadores batendo regeneração HP perk\\"", "timeout": 60000}
+</tool_call bash>
+<tool_call bash>
+<tool_arguments>
+{"command": "~/rag-memory/.venv/bin/python ~/rag-memory/scripts/query.py \\"Decaying Winter perks lista classes traits wiki rblx-decaying-winter\\"", "timeout": 60000}
+</tool_call bash></tool_call>`;
+
+  const res = parser.feed(input);
+  const flushed = parser.flush();
+  const total = [...res.toolCalls, ...flushed.toolCalls];
+
+  assert.strictEqual(total.length, 2, 'Should extract both bash tool calls');
+  assert.strictEqual(total[0].name, 'bash');
+  assert.strictEqual(total[1].name, 'bash');
+  assert.ok((total[0].arguments as any).command.includes('Decaying Winter'));
+  assert.strictEqual((total[0].arguments as any).timeout, 60000);
+});
+
+test('StreamingToolParser: handles <tool_call_dangerously_skip_permissions> tag variant', () => {
+  const parser = new StreamingToolParser();
+  const input = `<tool_call_dangerously_skip_permissions>
+{"name": "bash", "arguments": {"command": "~/rag-memory/.venv/bin/python ~/rag-memory/scripts/query.py \\"Decadent Winter robson roblox build\\""}}
+</tool_call_dangerously_skip_permissions>`;
+
+  const res = parser.feed(input);
+  const flushed = parser.flush();
+  const total = [...res.toolCalls, ...flushed.toolCalls];
+
+  assert.strictEqual(total.length, 1, 'Should extract the tool call');
+  assert.strictEqual(total[0].name, 'bash');
+  assert.ok((total[0].arguments as any).command.includes('Decadent Winter'));
+});
+
+

@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events'
+import os from 'os'
 import { config } from './config.js'
 import { metrics } from './metrics.js'
 
@@ -50,8 +51,11 @@ export class Watchdog extends EventEmitter {
   }
 
   private checkRAM(): 'ok' | 'warning' | 'critical' {
-    const mem = process.memoryUsage()
-    const usagePercent = (mem.heapUsed / mem.heapTotal) * 100
+    // Use real RSS against total system RAM. V8's heapUsed/heapTotal almost
+    // always sits above 95% (heapTotal is just a ceiling), producing false
+    // 'critical' health statuses while actual memory usage is low. Thresholds
+    // now mean '% of total system RAM' (see RAM_WARNING/RAM_CRITICAL in .env).
+    const usagePercent = (process.memoryUsage().rss / os.totalmem()) * 100
 
     if (usagePercent > config.watchdog.ram.criticalThreshold) return 'critical'
     if (usagePercent > config.watchdog.ram.warningThreshold) return 'warning'

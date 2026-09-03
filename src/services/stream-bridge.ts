@@ -13,6 +13,9 @@ const streamCallbacks = new Map<string, {
 
 const abortControllers = new Map<string, () => void>();
 
+// Track in-flight page.evaluate() promises so we can detect stuck pages.
+const evalPromises = new Map<string, { page: Page; startedAt: number }>();
+
 const pagesWithExposed = new WeakSet<Page>();
 
 async function ensureStreamBridge(page: Page): Promise<void> {
@@ -42,7 +45,7 @@ export async function browserFetch(
   } = {},
 ): Promise<{ status: number; statusText: string; contentType: string; body: string; headers: Record<string, string> }> {
   await ensureStreamBridge(page);
-  const reqId = crypto.randomUUID();
+const reqId = crypto.randomUUID();
 
   const timeoutMs = options.timeoutMs || 30000;
   const watcher = startCaptchaWatcher(page, timeoutMs);
@@ -117,15 +120,21 @@ export async function browserStreamFetch(
 
   const metaTimeoutMs = options.timeoutMs || config.timeouts.chat;
   const metaTimeout = setTimeout(() => {
+    // Force-abort the in-browser fetch so page.evaluate() can unstick.
+    page.evaluate((rid: string) => {
+      const c = (window as any).__abortControllers?.[rid];
+      if (c) { c.abort(); delete (window as any).__abortControllers[rid]; }
+    }, reqId).catch(() => {});
     streamCallbacks.delete(reqId);
     abortControllers.delete(reqId);
+    evalPromises.delete(reqId);
     metaReject(new Error(`Browser stream fetch timed out waiting for response metadata after ${metaTimeoutMs}ms`));
   }, metaTimeoutMs);
 
   streamCallbacks.set(reqId, {
     onMeta: (meta) => {
       clearTimeout(metaTimeout);
-      metaResolve(meta);
+metaResolve(meta);
     },
     onChunk: () => {},
     onEnd: () => {},
@@ -136,6 +145,7 @@ export async function browserStreamFetch(
     onBody: () => {},
   });
 
+  let bodyAccum = "";
   let bodyResolve!: (value: string) => void;
   let bodyReject!: (reason: Error) => void;
   const bodyPromise = new Promise<string>((resolve, reject) => {
@@ -152,11 +162,12 @@ export async function browserStreamFetch(
         const cb = streamCallbacks.get(reqId);
         if (!cb) return;
         cb.onChunk = (chunk: string) => {
+          bodyAccum += chunk;
           try { controller.enqueue(enc.encode(chunk)); } catch { /* ignore */ }
         };
         cb.onEnd = () => {
           try { controller.close(); } catch { /* ignore */ }
-          bodyResolve('');
+          bodyResolve(bodyAccum);
           streamCallbacks.delete(reqId);
           abortControllers.delete(reqId);
         };
@@ -167,11 +178,12 @@ export async function browserStreamFetch(
           abortControllers.delete(reqId);
         };
         cb.onBody = (text: string) => {
-          bodyResolve(text);
+        bodyResolve(text);
           streamCallbacks.delete(reqId);
           abortControllers.delete(reqId);
         };
 
+        evalPromises.set(reqId, { page, startedAt: Date.now() });
         page.evaluate(async ({ url, options, reqId, evalTimeoutMs }: any) => {
           const controller = new AbortController();
           (window as any).__abortControllers = (window as any).__abortControllers || {};
@@ -187,7 +199,7 @@ export async function browserStreamFetch(
             clearTimeout(timeoutId);
             const respHeaders: Record<string, string> = {};
             resp.headers.forEach((v: string, k: string) => { respHeaders[k] = v; });
-            (window as any).__streamRelay(reqId, 'meta', {
+(window as any).__streamRelay(reqId, 'meta', {
               status: resp.status,
               statusText: resp.statusText,
               contentType: resp.headers.get('content-type') || '',
@@ -201,6 +213,14 @@ export async function browserStreamFetch(
               return;
             }
 
+            const respContentType = resp.headers.get("content-type") || "";
+            if (!respContentType.includes("text/event-stream")) {
+              const bodyText = await resp.text();
+              (window as any).__streamRelay(reqId, "body", bodyText);
+              (window as any).__streamRelay(reqId, "end", null);
+              delete (window as any).__abortControllers[reqId];
+              return;
+            }
             const reader = resp.body.getReader();
             const decoder = new TextDecoder();
             // Coalesce chunks before crossing the CDP bridge. Each __streamRelay call
@@ -224,7 +244,8 @@ export async function browserStreamFetch(
                   (window as any).__streamRelay(reqId, 'end', null);
                   break;
                 }
-                pending += decoder.decode(value, { stream: true });
+                const chunk = decoder.decode(value, { stream: true });
+                pending += chunk;
                 if (!firstChunkSent) {
                   // Fast-path: flush the first byte(s) immediately to minimize TTFT.
                   if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
@@ -251,7 +272,10 @@ export async function browserStreamFetch(
             (window as any).__streamRelay(reqId, 'error', e.message);
             delete (window as any).__abortControllers[reqId];
           }
-        }, { url, options, reqId, evalTimeoutMs: metaTimeoutMs }).catch((e: any) => {
+        }, { url, options, reqId, evalTimeoutMs: metaTimeoutMs }).then(() => {
+          evalPromises.delete(reqId);
+        }).catch((e: any) => {
+          evalPromises.delete(reqId);
           const cb = streamCallbacks.get(reqId);
           if (cb) {
             cb.onError(e.message);
@@ -265,6 +289,7 @@ export async function browserStreamFetch(
         }, reqId).catch(() => {});
         streamCallbacks.delete(reqId);
         abortControllers.delete(reqId);
+        evalPromises.delete(reqId);
       },
     });
 
@@ -277,6 +302,7 @@ export async function browserStreamFetch(
       }, reqId).catch(() => {});
       streamCallbacks.delete(reqId);
       abortControllers.delete(reqId);
+      evalPromises.delete(reqId);
     };
 
     abortControllers.set(reqId, abortFn);
@@ -292,3 +318,33 @@ export async function browserStreamFetch(
     watcher.stop();
   }
 }
+
+/**
+ * Check if a page has stuck eval promises (stream fetches that never resolved).
+ * Returns true if the page should be considered unhealthy and refreshed.
+ */
+export function hasStuckEvals(page: Page, maxAgeMs = 180_000): boolean {
+  const now = Date.now();
+  for (const [reqId, entry] of evalPromises) {
+    if (entry.page === page && (now - entry.startedAt) > maxAgeMs) {
+      console.warn(`[StreamBridge] Stuck eval detected on page (reqId=${reqId}, age=${now - entry.startedAt}ms). Page needs recovery.`);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Forcefully clean up all stuck eval promises for a given page.
+ * Call this after refreshing a page to prevent stale callbacks.
+ */
+export function cleanupPageEvals(page: Page): void {
+  for (const [reqId, entry] of evalPromises) {
+    if (entry.page === page) {
+      evalPromises.delete(reqId);
+      streamCallbacks.delete(reqId);
+      abortControllers.delete(reqId);
+    }
+  }
+}
+

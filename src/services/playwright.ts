@@ -5,6 +5,7 @@ export {
   Mutex,
   activePage,
   resolveBrowserEngine,
+  resolveBraveExecutable,
   initPlaywright,
   closePlaywright,
   loginToQwen,
@@ -13,6 +14,9 @@ export {
   extractAccountInfoFromContext,
   closePlaywrightForAccount,
   getPageForAccount,
+  saveStorageState,
+  importSessionFromRunningBrowser,
+  refreshPageToFreshChat,
 } from './browser-manager.js';
 
 export {
@@ -25,7 +29,9 @@ export {
 export {
   browserFetch,
   browserStreamFetch,
+  hasStuckEvals,
+  cleanupPageEvals,
 } from './stream-bridge.js';
 
-export { getStealthScript } from './stealth.js';
+export { getStealthScript, getLoginStealthScript } from './stealth.js';
 export { solveBaxiaCaptcha, startCaptchaWatcher } from './captcha-solver.js';

@@ -1,5 +1,65 @@
 import type { FingerprintProfile } from './fingerprint.js';
 
+/**
+ * Minimal stealth for interactive/manual login flows where the browser should
+ * present its REAL fingerprint (real binary, real OS, real GPU). Only removes
+ * automation traces that would otherwise be visible to anti-bot scripts:
+ * navigator.webdriver, $cdc_/$wdc_ keys and injected-script performance entries.
+ * No UA/platform/WebGL forgery — that would create a detectable inconsistency
+ * between the real browser binary and the spoofed fingerprint.
+ */
+export function getLoginStealthScript(): string {
+  return `
+    (function() {
+      const nativeToString = Function.prototype.toString;
+      const spoofedFunctions = new WeakSet();
+
+      Function.prototype.toString = function() {
+        if (spoofedFunctions.has(this)) {
+          return 'function ' + (this.name || '') + '() { [native code] }';
+        }
+        return nativeToString.call(this);
+      };
+      spoofedFunctions.add(Function.prototype.toString);
+
+      try {
+        const proto = Object.getPrototypeOf(navigator);
+        const desc = Object.getOwnPropertyDescriptor(proto, 'webdriver');
+        if (desc && desc.configurable) {
+          Object.defineProperty(proto, 'webdriver', {
+            get: () => undefined,
+            configurable: true,
+            enumerable: true,
+          });
+          spoofedFunctions.add(Object.getOwnPropertyDescriptor(proto, 'webdriver').get);
+        }
+      } catch(e) {}
+
+      try {
+        const keys = Object.keys(document);
+        for (const key of keys) {
+          if (key.startsWith('$cdc_') || key.startsWith('$wdc_')) {
+            delete document[key];
+          }
+        }
+      } catch(e) {}
+
+      try {
+        if (window.performance && window.performance.getEntriesByType) {
+          const originalGetEntries = window.performance.getEntriesByType.bind(window.performance);
+          window.performance.getEntriesByType = function(type) {
+            const entries = originalGetEntries(type);
+            if (type === 'resource') {
+              return entries.filter(e => !e.name.includes('__injectedScript') && !e.name.includes('addInitScript'));
+            }
+            return entries;
+          };
+        }
+      } catch(e) {}
+    })();
+  `;
+}
+
 export function getStealthScript(profile: FingerprintProfile): string {
   return `
     (function() {

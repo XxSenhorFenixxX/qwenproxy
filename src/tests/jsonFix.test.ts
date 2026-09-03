@@ -147,3 +147,14 @@ test('robustParseJSON: handles missing opening quote with unquoted key', () => {
   assert.strictEqual(result.name, 'read');
   assert.strictEqual(result.arguments.filePath, '/tmp/test.ts');
 });
+
+test('robustParseJSON: handles unbracketed object arrays (e.g. todowrite)', () => {
+  const payload = `{"name": "todowrite", "arguments": {"todos": {"content": "Task 1", "status": "in_progress", "priority": "high"}, {"content": "Task 2", "status": "pending", "priority": "high"}}}`;
+  const result = robustParseJSON(payload);
+  assert.ok(result);
+  assert.strictEqual(result.name, 'todowrite');
+  assert.ok(Array.isArray(result.arguments.todos));
+  assert.strictEqual(result.arguments.todos.length, 2);
+  assert.strictEqual(result.arguments.todos[0].content, 'Task 1');
+  assert.strictEqual(result.arguments.todos[1].content, 'Task 2');
+});
