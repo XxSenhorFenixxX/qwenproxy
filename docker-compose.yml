@@ -9,8 +9,8 @@ services:
     env_file:
       - .env
     volumes:
-      - qwenproxy_data:/app/data
-      - qwenproxy_profiles:/app/qwen_profiles
+      - ./data:/app/data
+      - ./qwen_profiles:/app/qwen_profiles
       - type: tmpfs
         target: /tmp
         tmpfs:
@@ -22,8 +22,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4g
-          cpus: '2.0'
+          memory: 3g
+          cpus: "2.0"
         reservations:
           memory: 1g
     healthcheck:
@@ -37,7 +37,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  qwenproxy_data:
-  qwenproxy_profiles:

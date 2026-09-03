@@ -7,10 +7,12 @@
     "start:firefox": "npx tsx src/index.ts --browser=firefox",
     "start:chrome": "npx tsx src/index.ts --browser=chrome",
     "start:edge": "npx tsx src/index.ts --browser=edge",
+    "start:brave": "npx tsx src/index.ts --browser=brave",
     "login": "npx tsx src/login.ts",
     "login:firefox": "npx tsx src/login.ts --browser=firefox",
     "login:chrome": "npx tsx src/login.ts --browser=chrome",
     "login:edge": "npx tsx src/login.ts --browser=edge",
+    "login:brave": "npx tsx src/login.ts --browser=brave",
     "build": "tsc -p tsconfig.build.json",
     "test": "tsx --test src/**/*.test.ts",
     "typecheck": "tsc --noEmit",
@@ -55,7 +57,7 @@
     "typescript-eslint": "^8.61.1"
   },
   "bin": {
-    "qwenproxy": "./bin/qwenproxy.mjs"
+    "qwen": "./bin/qwenproxy.mjs"
   },
   "publishConfig": {
     "access": "public"

@@ -36,3 +36,27 @@ Thumbs.db
 
 
 
+
+# --- Session debris (never commit) ---
+# Secrets
+.env.bak*
+# Debug scripts from past sessions
+patch_parser*.py
+patch_bracket_debug.py
+unpatch_bracket_debug.py
+capture_brackets.py
+test-fix.mjs
+run.sh
+# Backup files
+*.bak
+*.bak-*
+*.bak2
+*.bak3
+*.antigravity-backup
+src/index.ts.bak
+# Ad-hoc dashboard/ops tooling (kept on disk, not part of the proxy)
+dashboard-server.js
+dashboard-server.py
+dashboard.html
+gerenciar.sh
+manter-sessao.sh

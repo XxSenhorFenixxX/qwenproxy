@@ -21,7 +21,7 @@ Proxy API local compatível com OpenAI que roteia requisições para os modelos 
 - **Tool Execution** — Sistema de execução de ferramentas locais integrado ao fluxo do chat.
 - **Session Persistence** — Perfil de navegador persistente por conta em `qwen_profiles/`.
 - **Auto-Login** — Login automático via credenciais com recuperação de sessão.
-- **Browser Selection** — Escolha entre Chromium, Chrome, Firefox, Edge ou WebKit.
+- **Browser Selection** — Escolha entre Chromium, Chrome, Brave, Firefox, Edge ou WebKit.
 - **Monitoring** — Health check, métricas Prometheus e watchdog integrados.
 - **CLI Binary** — Instale globalmente via npm e use o comando `qwenproxy` diretamente.
 - **Docker Ready** — Deploy para VPS com Docker, volumes persistentes e graceful shutdown.
@@ -111,8 +111,24 @@ QWEN_PASSWORD=sua-senha-aqui
 # Modo convidado - sem login, usa API pública (default: false)
 QWEN_GUEST_MODE_ONLY=false
 
-# Navegador (chromium, firefox, chrome, edge, webkit)
-BROWSER=chromium
+# Navegador (chromium, firefox, chrome, edge, webkit, brave)
+# IMPORTANTE: use o MESMO navegador com que a sessão foi criada (login manual / [E]).
+# Se a sessão veio do Brave real, use BROWSER=brave.
+BROWSER=brave
+
+# Caminho do executável do Brave (opcional, usado quando BROWSER=brave)
+# BRAVE_PATH=/usr/bin/brave-browser
+
+# Fingerprint do runtime: auto (default) | true | false
+# auto: forja fingerprint apenas nos engines embutidos (chromium/firefox/webkit);
+#       para navegadores reais instalados (brave/chrome/edge) mantém o fingerprint REAL,
+#       alinhado com a sessão criada no login — evita o TMD responder 200 vazio.
+# true: sempre forja (comportamento antigo). false: nunca forja.
+FORGE_FINGERPRINT=auto
+
+# Cooldown (em horas) aplicado quando o Qwen reporta rate limit SEM o aviso
+# "Wait about N hour(s)". Quando o aviso existe, ele sempre vence. (default: 24)
+RATE_LIMIT_COOLDOWN_HOURS=24
 
 # Executar navegador sem interface gráfica (default: true)
 HEADLESS=true
@@ -140,13 +156,30 @@ npm run login
 npm run login:firefox
 npm run login:chrome
 npm run login:edge
+npm run login:brave
 ```
+
+> **Dica anti-bot:** se o login manual apresentar mensagem de navegador não seguro / não confiável (verificação TMD do Alibaba), use `npm run login:chrome` ou `npm run login:brave`. O Chromium embutido do Playwright é facilmente detectado; um navegador real instalado (Chrome/Brave) passa muito mais fácil. No Brave, se o executável não for encontrado automaticamente, defina `BRAVE_PATH` no `.env`.
+>
+> O login manual agora abre o navegador com **perfil persistente** (`qwen_profiles/manual_login/`), acumulando histórico/localStorage entre execuções e apresentando o fingerprint real do navegador — sem forjar Windows/Chrome, o que evita inconsistências detectáveis.
 
 O menu interativo permite:
 - **[A]** Adicionar conta com credenciais (email + senha)
 - **[M]** Adicionar conta via login manual no navegador
+- **[E]** Importar sessão de um navegador real já aberto (contorna o anti-bot TMD)
 - **[R]** Remover uma conta
 - **[L]** Login em todas as contas (inicializar sessões)
+
+> **Importar sessão do navegador real (opção [E]):** quando o anti-bot do Qwen
+> (TMD) recusa a janela de login automatizada com "navegador não confiável", a
+> forma mais confiável é logar no **seu próprio navegador** e importar os cookies
+> frescos. O CLI detecta a porta de debug e, se necessário, abre o Brave
+> automaticamente com `--remote-debugging-port=9222` (se o Brave já estiver
+> aberto, feche-o primeiro — o Chromium ignora essa flag quando outra instância
+> está rodando). Entre em `https://chat.qwen.ai`, faça login normalmente, volte
+> ao CLI e a sessão será importada para `qwen_profiles/<id>_state.json`. Isso
+> funciona porque o TMD nunca vê automação — vê apenas um navegador real de
+> usuário logado.
 
 > Na primeira execução, se existir um `accounts.json` antigo, as contas serão migradas automaticamente para SQLite.
 
@@ -161,6 +194,7 @@ npm start                  # Chromium (padrão)
 npm run start:chrome       # Google Chrome
 npm run start:firefox      # Firefox
 npm run start:edge         # Microsoft Edge
+npm run start:brave        # Brave Browser
 ```
 
 O servidor inicia em `http://localhost:3000` com as seguintes rotas:
@@ -173,6 +207,7 @@ O servidor inicia em `http://localhost:3000` com as seguintes rotas:
 | `/v1/models/:model` | GET | Informações de um modelo específico |
 | `/v1/upload` | POST | Upload de arquivos multimodais (imagens, vídeos, áudios, documentos) |
 | `/health` | GET | Health check com status do sistema |
+| `/accounts/status` | GET | Mostra cada conta e se está **rate-limited** (bateu o limite diário) ou disponível |
 | `/metrics` | GET | Métricas no formato Prometheus |
 
 ---
@@ -321,7 +356,10 @@ qwenproxy/
 | Porta em uso | Altere `PORT` no `.env` ou encerre o processo na porta 3000 |
 | Navegador não abre | Execute `npx playwright install` |
 | Sessão expirada | Execute `npm run login` para renovar cookies |
+| Erro `200 OK` vazio em todas as requisições (anti-bot TMD silencioso) | O fingerprint do runtime não bate com o da sessão. Se a sessão foi criada no Brave real ([E]), use `BROWSER=brave` (e `FORGE_FINGERPRINT=auto`, o default) para o runtime apresentar o fingerprint real. Forjar Chrome/Windows numa sessão criada em Brave/Linux faz o TMD responder 200 vazio. Depois reinicie o servidor; se persistir, renove a sessão com `npm run login` → **[E]** |
+| "Navegador não seguro" no login manual | Use a opção **[E]** `npm run login` — faça login no seu navegador real e importe a sessão via `--remote-debugging-port=9222` |
 | Rate limit em todas as contas | Adicione mais contas via `npm run login` |
+| Conta com limite diário estourado continua sendo usada | O proxy agora detecta o erro de rate limit em **todos** os pontos (antes do stream, durante o stream e no warm pool), marca a conta com cooldown e pula para a próxima. Verifique o estado de cada conta em `GET /accounts/status` |
 | Banco corrompido | Apague `data/qwenproxy.db` e re-adicione as contas |
 
 ---
