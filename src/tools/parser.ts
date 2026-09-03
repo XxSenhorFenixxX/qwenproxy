@@ -438,7 +438,13 @@ export class StreamingToolParser {
         // Hold the partial TOOL tail; emit only the text that precedes it.
         const lastNl = this.buffer.lastIndexOf('\n');
         const tail = lastNl === -1 ? this.buffer : this.buffer.substring(lastNl + 1);
-        if (tail.trimStart().startsWith('TOOL:')) {
+        const _trimmedTail = tail.trimStart();
+        // Hold the tail when it starts with "TOOL:" OR is a partial prefix of it
+        // ("T", "TO", "TOO", "TOOL"). Streaming chunks can split the prefix
+        // mid-way; flushing it would leak the whole tool line as text.
+        const _isToolLineStart = _trimmedTail.startsWith('TOOL:') ||
+          (_trimmedTail.length > 0 && _trimmedTail.length < 'TOOL:'.length && 'TOOL:'.startsWith(_trimmedTail));
+        if (_isToolLineStart) {
           if (lastNl > 0 && this.emittedToolCallCount === 0) {
             result.text += this.buffer.substring(0, lastNl + 1);
           }
