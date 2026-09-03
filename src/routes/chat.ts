@@ -163,18 +163,24 @@ export async function chatCompletions(c: Context) {
     }
 
     const isThinkingModel = !body.model.includes('no-thinking');
+    const completionId = 'chatcmpl-' + crypto.randomUUID();
 
+    /**
+     * Open one upstream Qwen stream for a given prompt, with the full account
+     * routing/cooldown/retry/guest-fallback logic. Reusable so a tool-call retry
+     * can transparently re-request with a reinforced prompt.
+     */
+    const openUpstreamStream = async (prompt: string): Promise<{ stream: ReadableStream; uiSessionId: string }> => {
     const isGuestModeOnly = process.env.QWEN_GUEST_MODE_ONLY?.toLowerCase() === 'true';
     let stream: ReadableStream | undefined;
     let uiSessionId = '';
-    const completionId = 'chatcmpl-' + crypto.randomUUID();
     let lastError: any = null;
 
     if (isGuestModeOnly) {
       console.log('[Chat] Guest mode only enabled. Bypassing account rotation.');
       try {
         const result = await createQwenStream(
-          finalPrompt,
+          prompt,
           isThinkingModel,
           body.model,
           null,
@@ -249,7 +255,7 @@ export async function chatCompletions(c: Context) {
           while (retries > 0) {
             try {
               const result = await createQwenStream(
-                finalPrompt,
+                prompt,
                 isThinkingModel,
                 body.model,
                 null,
@@ -328,7 +334,7 @@ export async function chatCompletions(c: Context) {
         console.warn(`[Chat] CRITICAL: All accounts are rate-limited, on cooldown, or none configured! Falling back to GUEST mode.`);
         try {
           const result = await createQwenStream(
-            finalPrompt,
+            prompt,
             isThinkingModel,
             body.model,
             null,
@@ -354,19 +360,40 @@ export async function chatCompletions(c: Context) {
       }
     }
 
+    return { stream: stream!, uiSessionId };
+    };
+
+    // One-shot transparent retry when tools are active but the response contains
+    // no tool call (model narrated instead). Disable with QWEN_TOOL_RETRY=0.
+    const toolRetryEnabled = process.env.QWEN_TOOL_RETRY !== '0';
+    const toolsActive = hasTools && toolChoiceMode !== 'none';
+    const TOOL_RETRY_REINFORCEMENT =
+      '\n\n[IMPORTANTE / IMPORTANT] Sua resposta anterior não incluiu nenhuma chamada de ferramenta (tool call), mas esta tarefa exige uma. ' +
+      'Responda AGORA apenas com a linha de tool call no formato exato abaixo e nenhum outro texto (sem planos, sem explicações, sem markdown):\n' +
+      'TOOL: <tool_name> | {<json dos argumentos>}\n' +
+      'Use o nome exato da ferramenta e argumentos JSON válidos.';
+    const retryStreamFactory = toolsActive && toolRetryEnabled
+      ? () => openUpstreamStream(finalPrompt + TOOL_RETRY_REINFORCEMENT)
+      : undefined;
+
+    const opened = await openUpstreamStream(finalPrompt);
+    const stream = opened.stream;
+    const uiSessionId = opened.uiSessionId;
+
     if (!isStream) {
-      return handleNonStreamingResponse(c, stream!, completionId, body.model, uiSessionId, hasTools && toolChoiceMode !== 'none', bodyAny.tools || []);
+      return handleNonStreamingResponse(c, stream, completionId, body.model, uiSessionId, toolsActive, bodyAny.tools || [], retryStreamFactory);
     }
 
     return handleStreamingResponse(c, {
-      stream: stream!,
+      stream,
       completionId,
       model: body.model,
       uiSessionId,
-      hasTools: hasTools && toolChoiceMode !== 'none',
+      hasTools: toolsActive,
       tools: bodyAny.tools || [],
       finalPrompt,
-      streamOptions: body.stream_options
+      streamOptions: body.stream_options,
+      retryStreamFactory
     });
   } catch (err: any) {
     console.error('Error in chatCompletions:', err)
