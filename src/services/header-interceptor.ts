@@ -288,6 +288,20 @@ async function _getQwenHeadersInternal(forceNew = false, accountId?: string): Pr
   } catch (err: any) {
     const cacheKey = accountId || 'global';
     if (!forceNew && err?.message?.includes('Timeout waiting for Qwen headers for')) {
+      // Only wipe-and-retry when a retry can actually recover. For per-account
+      // lanes with NO stored password (Google OAuth / re-import-via-[E] only) a
+      // fresh profile cannot auto-login, so resetting has zero chance of
+      // success — it only destroys a profile the user must re-import by hand.
+      // Seen live 2026-09-04: header capture on expired sessions timed out and
+      // resetBrowserProfile wiped freshly imported sessions at startup.
+      if (accountId) {
+        const { getAccountCredentials } = await import('../core/accounts.js');
+        const creds = getAccountCredentials(getBaseAccountId(accountId));
+        if (!creds?.password) {
+          console.warn(`[Playwright] Header capture timed out for ${cacheKey}; no password stored (re-import via [E] only) — skipping profile reset (would only delete the importable session).`);
+          throw err;
+        }
+      }
       console.warn(`[Playwright] Header capture timed out for ${cacheKey}; clearing browser profile and retrying once...`);
       await resetBrowserProfile(cacheKey, accountId);
       if (!accountId && getActiveAccountCount() === 0) {
@@ -391,9 +405,12 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
   // to /auth on session expiry — it stays on chat.qwen.ai and shows a
   // "Fazer login" button. The isLoginPage check above only catches actual
   // auth redirects and email input fields, NOT this guest-mode state.
-  const loggedIn = true; // DISABLED
+  // Positive-signal check (see browser-manager.ts isPageLoggedIn): reports
+  // logged-in only on real user UI; ambiguous pages report false so an
+  // expired session never silently passes. Formerly `true // DISABLED`.
+  const loggedIn = await isPageLoggedIn(page).catch(() => false);
   if (!loggedIn && accountId) {
-    console.warn(`[Playwright] Page not logged in for ${cacheKey} (login button visible). Re-logging in...`);
+    console.warn(`[Playwright] Page not logged in for ${cacheKey} (no positive logged-in UI). Re-logging in...`);
     const { getAccountCredentials } = await import('../core/accounts.js');
     const creds = getAccountCredentials(getBaseAccountId(accountId));
     if (creds && creds.email && creds.password) {

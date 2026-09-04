@@ -18,7 +18,8 @@ async function performKeepAlive(accountId: string, page: Page): Promise<void> {
   if (page.isClosed()) return;
 
   try {
-    // Check if session has expired (login button visible)
+    // Positive-signal session check (see browser-manager.ts isPageLoggedIn):
+    // only real logged-in UI counts; ambiguous pages report false.
     const { isPageLoggedIn } = await import('./browser-manager.js');
     const loggedIn = await isPageLoggedIn(page);
     if (!loggedIn) {

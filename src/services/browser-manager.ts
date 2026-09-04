@@ -84,29 +84,188 @@ export function shouldForgeFingerprint(): boolean {
 }
 
 /**
- * Selectors that appear when the user is NOT logged in (across locales).
- * Used by isPageLoggedIn to detect stale/expired sessions.
+ * ============================================================================
+ * Login-state detection — POSITIVE-signal rewrite (2026-09-04)
+ * ============================================================================
+ * WHY THIS IS DIFFERENT: the three previous attempts all detected "logged in"
+ * NEGATIVELY (inferring a session from the ABSENCE of a login button):
+ *   1st: Google-OAuth page rendered a stray login element while logged in  → false positive
+ *   2nd: URL sniffing on /c/ was fragile (Qwen keeps /c/ URLs when expired)
+ *   3rd: disabled entirely (always true)                                  → no detection
+ * This version detects POSITIVELY: it only reports "logged in" when it sees
+ * UI that exclusively exists with a real session (user avatar / account entry
+ * in the top bar, conversation history). It NEVER infers login from a missing
+ * login button. When the state is ambiguous (no positive AND no negative
+ * marker found) it reports NOT logged in, so the re-login path fires instead
+ * of silently trusting a possibly-dead session.
+ *
+ * EMPIRICAL BASIS — chat.qwen.ai (pt-BR) probed 2026-09-04:
+ *   - Guest/expired landing (chat.qwen.ai/): top bar shows "Fazer login" +
+ *     "Inscrever-se" (SPAN.qwen-chat-v2-btn-content). NO avatar, NO sidebar,
+ *     NO history. The chat composer (.message-input-textarea + the send
+ *     button) IS present in guest mode too → deliberately NOT a signal.
+ *   - Logged-in top bar replaces the CTAs with a user avatar/account entry.
+ * Calibration: LOGIN_STATE_DEBUG=true logs a per-page DOM fingerprint so any
+ * future Qwen UI change shows up in the container logs instead of silently
+ * flipping the verdict.
+ * ============================================================================
  */
-const LOGIN_BUTTON_SELECTORS = [
-  'button:has-text("Fazer login")',
-  'button:has-text("Login")',
-  'button:has-text("Log in")',
-  'button:has-text("Sign in")',
-  'a:has-text("Fazer login")',
-  'a:has-text("Login")',
-  'a:has-text("Log in")',
-  'a:has-text("Sign in")',
+
+/** Visible-text markers of the logged-OUT / guest header (localized). */
+const GUEST_CTA_RE = /fazer login|inscrever-se|sign in|sign up|log in|create account|entrar|criar conta|iniciar sesi\u00f3n|crear cuenta|\u767b\u5f55|\u6ce8\u518c|\u7acb\u5373\u767b\u5f55/i;
+
+/** Visible-text markers of an expired-session dialog/overlay mid-chat. */
+const EXPIRED_DIALOG_RE = /sess\u00e3o expirada|login novamente|session expired|log in again|sign back in|\u91cd\u65b0\u767b\u5f55|\u767b\u5f55\u5df2\u8fc7\u671f|vuelve a iniciar sesi\u00f3n|vuelva a iniciar sesi\u00f3n/i;
+
+/**
+ * POSITIVE signals: CSS selectors for UI that only exists when really logged
+ * in. Calibrated against live DOM probes; every selector must be verified in
+ * BOTH states (logged-in AND guest/expired) before relying on it.
+ */
+const LOGGED_IN_CSS_SELECTORS = [
+  // VERIFIED 2026-09-04 on live chat.qwen.ai (pt-BR) — all present when logged
+  // in, all ABSENT on the guest landing page AND on the expired-session
+  // /c/new-chat shell (which renders neither sidebar nor user area):
+  '[class*="sidebar-user"]',   // user area at the bottom of the sidebar
+  '.user-menu-btn',            // avatar / account menu button
+  'img.user-img',              // user avatar image
+  '[class*="user-menu-container"]',
+  '.sidebar',                  // conversation sidebar (logged-in only)
+  // Generic avatar-ish fallbacks (kept for robustness across future layouts).
+  'img[class*="avatar"]',
+  '[data-testid*="avatar"]',
 ];
 
 /**
- * Checks whether a Qwen page shows a logged-in state by looking for the
- * "Fazer login" / "Login" / "Sign in" button. If ANY such button is
- * visible the page is in guest mode (session expired or never authenticated).
+ * Probes the live DOM and classifies the login state. One page.evaluate
+ * round-trip; safe to call on any qwen.ai page.
  */
-export async function isPageLoggedIn(_page: Page): Promise<boolean> {
-  // DISABLED: giving false positives on landing page. Always return true
-  // to prevent unnecessary re-login that destroys valid sessions.
-  return true;
+function probeLoginState(page: Page): Promise<{ state: 'logged-in' | 'logged-out' | 'ambiguous'; summary: string; navAgeMs: number }> {
+  return page.evaluate(({ GUEST_CTA_RE_SRC, EXPIRED_DIALOG_RE_SRC, LOGGED_IN_CSS_SELECTORS }) => {
+    const guestRe = new RegExp(GUEST_CTA_RE_SRC, 'i');
+    const expiredRe = new RegExp(EXPIRED_DIALOG_RE_SRC, 'i');
+    const navAgeMs = Math.round(performance.now() - ((performance.getEntriesByType('navigation')[0] as any)?.startTime ?? 0));
+    const visible = (el: Element) => {
+      if (!(el instanceof HTMLElement)) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+    };
+
+    // Scan leaf-ish elements carrying their own text (avoids matching the
+    // whole page for one CTA word buried in a legal paragraph).
+    const ownText = (el: Element): string => {
+      let t = '';
+      for (const n of el.childNodes) {
+        if (n.nodeType === Node.TEXT_NODE) t += n.textContent || '';
+      }
+      return t.trim();
+    };
+    const leaves = [...document.querySelectorAll('body *')].filter(visible);
+
+    const ctaTexts: string[] = [];
+    const expiredTexts: string[] = [];
+    for (const el of leaves) {
+      const t = ownText(el);
+      if (t.length === 0 || t.length > 40) continue;
+      if (guestRe.test(t)) ctaTexts.push(t);
+      if (expiredRe.test(t)) expiredTexts.push(t);
+    }
+
+    const userMarkers: string[] = [];
+    for (const sel of LOGGED_IN_CSS_SELECTORS) {
+      try {
+        for (const el of document.querySelectorAll(sel)) {
+          if (visible(el)) userMarkers.push(sel);
+        }
+      } catch { /* invalid selector */ }
+    }
+
+    const hasAuthFormInputs = leaves.some(el => {
+      const tag = el.tagName;
+      return (tag === 'INPUT' || tag === 'TEXTAREA') && (el as HTMLInputElement).type === 'email';
+    }) || leaves.some(el => el.tagName === 'INPUT' && (el as HTMLInputElement).type === 'password');
+
+    // Verdict ordering — read carefully, each case was paid for in blood:
+    // 1. Expired-session dialog text → logged OUT (session died mid-chat).
+    // 2. A real auth FORM (email/password inputs visible) → logged OUT. This
+    //    is the ONLY negative signal strong enough to override positives.
+    // 3. Positive user markers present (avatar/account/history) → logged IN,
+    //    even if a stray "Fazer login" text is visible. That combination is
+    //    the Google-OAuth case that false-positived attempt #1 and destroyed
+    //    valid sessions: a bare login element can be rendered while the
+    //    session is actually valid, so it never overrides a solid positive.
+    // 4. No positive + guest CTA visible → logged OUT (guest landing).
+    // 5. Neither clear → AMBIGUOUS → treated as logged OUT (never assume
+    //    logged-in on doubt; the 6h cron remains the safety net).
+    const uniqMarkers = [...new Set(userMarkers)].join('|');
+    if (expiredTexts.length > 0) return { state: 'logged-out', summary: `expired-dialog(${expiredTexts.join('|')})`, navAgeMs };
+    if (hasAuthFormInputs) return { state: 'logged-out', summary: `auth-form-inputs${userMarkers.length ? `(despite markers ${uniqMarkers})` : ''}`, navAgeMs };
+    if (userMarkers.length > 0) return { state: 'logged-in', summary: `user-markers(${uniqMarkers})`, navAgeMs };
+    if (ctaTexts.length > 0) return { state: 'logged-out', summary: `guest-cta(${ctaTexts.join('|')})`, navAgeMs };
+    return { state: 'ambiguous', summary: 'no-positive-no-negative', navAgeMs };
+  }, {
+    GUEST_CTA_RE_SRC: GUEST_CTA_RE.source,
+    EXPIRED_DIALOG_RE_SRC: EXPIRED_DIALOG_RE.source,
+    LOGGED_IN_CSS_SELECTORS,
+  });
+}
+
+/**
+ * Checks whether a Qwen page is genuinely logged in, using POSITIVE signals
+ * only (see note above). Ambiguous pages report NOT logged in.
+ */
+export async function isPageLoggedIn(page: Page): Promise<boolean> {
+  if (!page || page.isClosed()) return false;
+  try {
+    let verdict = await probeLoginState(page);
+    // A POSITIVE verdict (avatar/sidebar/user menu) is trusted immediately:
+    // those markers only render with a real session, on any page age.
+    if (verdict.state === 'logged-in') {
+      if (process.env.LOGIN_STATE_DEBUG === 'true') {
+        console.log(`[LoginState] logged-in @ ${page.url()} — ${verdict.summary}`);
+      }
+      return true;
+    }
+
+    // A non-positive verdict (logged-out / ambiguous) is only trusted once the
+    // page has settled. Measured 2026-09-04: right after navigation a VALID
+    // session can transiently render the guest landing or an empty shell for
+    // seconds before the SPA hydrates the logged-in UI (sidebar/user markers
+    // appeared at ~3-6s solo, and LATER under concurrent account init / slow
+    // startup load). Trusting that early non-positive verdict would false-
+    // negative valid sessions (the failure of attempts #1-3).
+    //
+    // Patience is anchored to WALL CLOCK since the first probe (not to
+    // navigation age): a slow navigation can make the first probe land at a
+    // nav age past any fixed window, which would skip patience entirely — seen
+    // live 2026-09-04 (valid goginhopeixe session probed first at navAge
+    // ~17s → ambiguous shell → instant non-positive, later rescued by the warm
+    // pool). Re-probe every 2s while EITHER the navigation is young (<25s) OR
+    // the page is still an un-hydrated shell (ambiguous), capped at 12s wall
+    // clock. A positive verdict wins the instant it appears. A decisive guest-
+    // CTA verdict on a MATURE page (>25s old — e.g. the session-keeper path)
+    // is trusted immediately, keeping keeper cycles cheap.
+    const probes = [`${verdict.state}:${verdict.summary}@${verdict.navAgeMs}ms`];
+    const patienceStart = Date.now();
+    while (
+      verdict.state !== 'logged-in'
+      && (verdict.navAgeMs < 25000 || verdict.state === 'ambiguous')
+      && Date.now() - patienceStart < 12000
+    ) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      if (page.isClosed()) return false;
+      verdict = await probeLoginState(page);
+      probes.push(`${verdict.state}:${verdict.summary}@${verdict.navAgeMs}ms`);
+    }
+    if (process.env.LOGIN_STATE_DEBUG === 'true' || verdict.state !== 'logged-in') {
+      console.log(`[LoginState] ${verdict.state} @ ${page.url()} — ${verdict.summary} [probes: ${probes.join(' → ')}]`);
+    }
+    return verdict.state === 'logged-in';
+  } catch (err: any) {
+    console.warn(`[LoginState] probe failed on ${page.url()}: ${err.message}`);
+    return false;
+  }
 }
 
 export function getBrowserIdentity(accountId?: string): { userAgent: string; secChUa: string; platform: string; profile?: FingerprintProfile } {
@@ -736,7 +895,7 @@ export async function initPlaywrightForAccount(account: QwenAccount, _headless =
       if (loggedIn) {
         console.log(`[Playwright] Session validated for ${account.email}.`);
       } else {
-        console.warn(`[Playwright] Session expired for ${account.email} (page shows login button). Re-logging in...`);
+        console.warn(`[Playwright] Session expired for ${account.email} (no logged-in UI detected). Re-logging in...`);
         if (account.email && account.password) {
           // Clear stale cookies BEFORE re-login so the new auth tokens
           // from the API signin call are not shadowed by old expired ones.
@@ -747,7 +906,7 @@ export async function initPlaywrightForAccount(account: QwenAccount, _headless =
           if (recheck) {
             console.log(`[Playwright] Re-login successful for ${account.email}.`);
           } else {
-            console.warn(`[Playwright] Re-login failed for ${account.email} (still showing login button). Manual intervention may be needed.`);
+            console.warn(`[Playwright] Re-login failed for ${account.email} (no logged-in UI detected after re-login). Manual intervention may be needed.`);
           }
         } else {
           console.warn(`[Playwright] Session expired for ${account.email} — no password stored (Google OAuth?). Re-import session via login.ts [E] or set password via login.ts [P].`);
