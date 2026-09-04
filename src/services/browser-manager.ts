@@ -137,6 +137,66 @@ const LOGGED_IN_CSS_SELECTORS = [
 ];
 
 /**
+ * ============================================================================
+ * LOGIN TRANSITION TRACKING
+ *
+ * Emits a prominent, greppable WARN exactly when an account transitions from
+ * "logged in" to "needs re-import" (SESSION-LOST). Without this, a session
+ * death is only visible as recurring per-check "expired" lines that blend
+ * into the noise — which is how the 5-account outage of 2026-09-04 went
+ * unnoticed until the service was returning 500 for everyone.
+ *
+ * State is keyed by base account id and seeded at init from the storage state
+ * file (its mtime = last time the profile was saved, a proxy for last known
+ * good session). The WARN fires once per transition (deduped until the
+ * account recovers), so it never spams.
+ * ============================================================================
+ */
+const lastLoggedInAt = new Map<string, number>();
+const transitionWarned = new Set<string>();
+
+function storageStateHasAuthToken(statePath: string | undefined): boolean {
+  if (!statePath) return false;
+  try {
+    const raw = fs.readFileSync(statePath, 'utf8');
+    const state = JSON.parse(raw);
+    return Array.isArray(state.cookies) && state.cookies.some((c: any) => c && c.name && /token|session/i.test(c.name));
+  } catch {
+    return false;
+  }
+}
+
+/** Seeds the tracker from a previously-saved profile (session died between runs). */
+export function seedLoginTransitionState(accountId: string, statePath: string | undefined): void {
+  if (!storageStateHasAuthToken(statePath)) return;
+  try {
+    lastLoggedInAt.set(accountId, fs.statSync(statePath as string).mtimeMs);
+  } catch {
+    lastLoggedInAt.set(accountId, Date.now());
+  }
+}
+
+/**
+ * Records a login-state verdict for an account and warns ONCE when it flips
+ * from logged-in to logged-out (grep: SESSION-LOST).
+ */
+export function recordLoginState(accountId: string, email: string, loggedIn: boolean): void {
+  if (loggedIn) {
+    lastLoggedInAt.set(accountId, Date.now());
+    if (transitionWarned.delete(accountId)) {
+      console.log(`[LoginState] ${email} recovered to logged-in (session re-imported or refreshed).`);
+    }
+    return;
+  }
+  const prev = lastLoggedInAt.get(accountId);
+  if (prev !== undefined && !transitionWarned.has(accountId)) {
+    transitionWarned.add(accountId);
+    const ago = Math.max(0, Math.round((Date.now() - prev) / 60000));
+    console.warn(`[LoginState][SESSION-LOST] ${email} (${accountId}) was logged in ~${ago} min ago and now requires re-import — session died. Re-import via login.ts [E]. grep: SESSION-LOST`);
+  }
+}
+
+/**
  * Probes the live DOM and classifies the login state. One page.evaluate
  * round-trip; safe to call on any qwen.ai page.
  */
@@ -852,6 +912,7 @@ export async function initPlaywrightForAccount(account: QwenAccount, _headless =
   console.log(`[Playwright] Creating context for account ${account.email} on shared browser...`);
 
   const storageState = loadStorageState(baseAccountId);
+  seedLoginTransitionState(baseAccountId, storageState);
   const acctProfile = shouldForgeFingerprint() ? getFingerprintProfile(account.id) : null;
   const acctContext = await sharedBrowser.newContext({
     ...sharedContextOptions(account.id),
@@ -892,6 +953,7 @@ export async function initPlaywrightForAccount(account: QwenAccount, _headless =
       // Qwen does NOT redirect to /auth on session expiry; it stays on
       // chat.qwen.ai/c/... and shows a "Fazer login" button instead.
       const loggedIn = await isPageLoggedIn(acctPage);
+      recordLoginState(baseAccountId, account.email, loggedIn);
       if (loggedIn) {
         console.log(`[Playwright] Session validated for ${account.email}.`);
       } else {

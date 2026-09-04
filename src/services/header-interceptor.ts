@@ -409,10 +409,22 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
   // logged-in only on real user UI; ambiguous pages report false so an
   // expired session never silently passes. Formerly `true // DISABLED`.
   const loggedIn = await isPageLoggedIn(page).catch(() => false);
+  if (accountId) {
+    const { recordLoginState } = await import('./browser-manager.js');
+    const { getAccountCredentials } = await import('../core/accounts.js');
+    const baseId = getBaseAccountId(accountId);
+    const email = getAccountCredentials(baseId)?.email || accountId;
+    if (loggedIn) {
+      recordLoginState(baseId, email, true);
+    }
+  }
   if (!loggedIn && accountId) {
     console.warn(`[Playwright] Page not logged in for ${cacheKey} (no positive logged-in UI). Re-logging in...`);
     const { getAccountCredentials } = await import('../core/accounts.js');
-    const creds = getAccountCredentials(getBaseAccountId(accountId));
+    const { recordLoginState } = await import('./browser-manager.js');
+    const baseId = getBaseAccountId(accountId);
+    const email = getAccountCredentials(baseId)?.email || accountId;
+    const creds = getAccountCredentials(baseId);
     if (creds && creds.email && creds.password) {
       const acctContext = accountContexts.get(accountId);
       if (acctContext) {
@@ -422,12 +434,20 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
         await page.goto('https://chat.qwen.ai/c/new-chat', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
         const recheck = await isPageLoggedIn(page);
         if (recheck) {
+          recordLoginState(baseId, email, true);
           console.log(`[Playwright] Re-login successful for ${cacheKey}.`);
         } else {
+          // Auto re-login failed — the session is genuinely lost and needs
+          // manual re-import (fires the SESSION-LOST transition WARN once).
+          recordLoginState(baseId, email, false);
           console.warn(`[Playwright] Re-login failed for ${cacheKey}. Headers capture may fail.`);
         }
       }
     } else {
+      // No password stored (Google OAuth) — no auto-recovery possible, so the
+      // session is genuinely lost until a manual [E] re-import. This is the
+      // SESSION-LOST transition the highlighted WARN exists for.
+      recordLoginState(baseId, email, false);
       console.warn(`[Playwright] No password stored for ${cacheKey} (Google OAuth?). Re-import session via login.ts [E] or set password via login.ts [P].`);
     }
   } else if (!loggedIn && !accountId) {

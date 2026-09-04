@@ -20,11 +20,19 @@ async function performKeepAlive(accountId: string, page: Page): Promise<void> {
   try {
     // Positive-signal session check (see browser-manager.ts isPageLoggedIn):
     // only real logged-in UI counts; ambiguous pages report false.
-    const { isPageLoggedIn } = await import('./browser-manager.js');
+    const { isPageLoggedIn, recordLoginState } = await import('./browser-manager.js');
     const loggedIn = await isPageLoggedIn(page);
     if (!loggedIn) {
+      const { getAccountCredentials } = await import('../core/accounts.js');
+      const email = getAccountCredentials(getBaseAccountId(accountId))?.email || accountId;
+      recordLoginState(getBaseAccountId(accountId), email, false);
       console.warn(`[SessionKeeper] Session expired for ${accountId}. Re-import via login.ts [E] or re-login manually.`);
       return;
+    }
+    {
+      const { getAccountCredentials } = await import('../core/accounts.js');
+      const email = getAccountCredentials(getBaseAccountId(accountId))?.email || accountId;
+      recordLoginState(getBaseAccountId(accountId), email, true);
     }
 
     const viewport = page.viewportSize();
